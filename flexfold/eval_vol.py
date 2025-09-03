@@ -1,0 +1,315 @@
+"""Evaluate the decoder of a heterogeneous model at given z-latent-space co-ordinates.
+
+Example usage
+-------------
+# This model used the default of zdim=8
+$ cryodrgn eval_vol 004_vae128/weights.pkl -c 004_vae128/config.yaml \
+                                           -o zero-vol.mrc -z 0 0 0 0 0 0 0 0
+
+# We can instead specify a z-latent-space path instead of a single location
+# Here the model was trained using zdim=4
+$ cryodrgn eval_vol 004_vae128/weights.pkl -c 004_vae128/config.yaml -o zero-vol.mrc \
+                                           --z-start 0 -1 0 0 --z-end 1 1 1 1
+
+"""
+import argparse
+import os
+import pprint
+from datetime import datetime as dt
+import logging
+import numpy as np
+import torch
+from cryodrgn import config
+from flexfold.models import HetOnlyVAE, AFDecoder
+from openfold.utils.tensor_utils import tensor_tree_map
+
+from cryodrgn.source import write_mrc
+from openfold.np import residue_constants, protein
+
+logger = logging.getLogger(__name__)
+def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
+
+    chain_index = np.zeros_like(aatype)
+    b_factors = np.zeros_like(all_atom_mask)
+    residue_index = np.arange(len(aatype))+1
+
+    pdb_elem = protein.Protein(
+        aatype=aatype,
+        atom_positions=all_atom_positions,
+        atom_mask=all_atom_mask,
+        residue_index=residue_index,
+        b_factors=b_factors,
+        chain_index=chain_index,
+        remark="",
+        parents=None,
+        parents_chain_index=None,
+    )
+    outstring = protein.to_pdb(pdb_elem)
+    with open(file, 'w') as fp:
+        fp.write(outstring)
+
+def add_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("weights", help="Model weights")
+    parser.add_argument(
+        "-c",
+        "--config",
+        metavar="YAML",
+        required=True,
+        help="CryoDRGN config.yaml file",
+    )
+    parser.add_argument(
+        "-o", type=os.path.abspath, required=True, help="Output .mrc or directory"
+    )
+    parser.add_argument("--device", type=int, help="Optionally specify CUDA device")
+    parser.add_argument(
+        "--prefix",
+        default="vol_",
+        help="Prefix when writing out multiple .mrc files (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true", help="Increase verbosity"
+    )
+
+    group = parser.add_argument_group("Specify z values")
+    group.add_argument("-z", type=np.float32, nargs="*", help="Specify one z-value")
+    group.add_argument(
+        "--z-start", type=np.float32, nargs="*", help="Specify a starting z-value"
+    )
+    group.add_argument(
+        "--z-end", type=np.float32, nargs="*", help="Specify an ending z-value"
+    )
+    group.add_argument(
+        "-n", type=int, default=10, help="Number of structures between [z_start, z_end]"
+    )
+    group.add_argument("--zfile", help="Text file with z-values to evaluate")
+
+    group = parser.add_argument_group("Volume arguments")
+    group.add_argument(
+        "--Apix",
+        type=float,
+        default=1,
+        help="Pixel size to add to .mrc header (default: %(default)s A/pix)",
+    )
+    group.add_argument(
+        "--flip", action="store_true", help="Flip handedness of output volume"
+    )
+    group.add_argument(
+        "--invert", action="store_true", help="Invert contrast of output volume"
+    )
+    group.add_argument(
+        "-d",
+        "--downsample",
+        type=int,
+        help="Downsample volumes to this box size (pixels)",
+    )
+    group.add_argument(
+        "--vol-start-index",
+        type=int,
+        default=0,
+        help="Default value of start index for volume generation (default: %(default)s)",
+    )
+
+    group = parser.add_argument_group(
+        "Overwrite architecture hyperparameters in config.yaml"
+    )
+    group.add_argument("--norm", nargs=2, type=float)
+    group.add_argument("-D", type=int, help="Box size")
+    group.add_argument(
+        "--enc-layers", dest="qlayers", type=int, help="Number of hidden layers"
+    )
+    group.add_argument(
+        "--enc-dim", dest="qdim", type=int, help="Number of nodes in hidden layers"
+    )
+    group.add_argument("--zdim", type=int, help="Dimension of latent variable")
+    group.add_argument(
+        "--encode-mode",
+        choices=("conv", "resid", "mlp", "tilt"),
+        help="Type of encoder network",
+    )
+    group.add_argument(
+        "--dec-layers", dest="players", type=int, help="Number of hidden layers"
+    )
+    group.add_argument(
+        "--dec-dim", dest="pdim", type=int, help="Number of nodes in hidden layers"
+    )
+    group.add_argument(
+        "--enc-mask", type=int, help="Circular mask radius for image encoder"
+    )
+    group.add_argument(
+        "--pe-type",
+        choices=(
+            "geom_ft",
+            "geom_full",
+            "geom_lowf",
+            "geom_nohighf",
+            "linear_lowf",
+            "none",
+        ),
+        help="Type of positional encoding",
+    )
+    group.add_argument(
+        "--feat-sigma", type=float, help="Scale for random Gaussian features"
+    )
+    parser.add_argument(
+        "--no_volume", action="store_true", help="TODO" #Remi
+    )
+    group.add_argument(
+        "--pe-dim",
+        type=int,
+        help="Num sinusoid features in positional encoding (default: D/2)",
+    )
+    group.add_argument("--domain", choices=("hartley", "fourier"))
+    group.add_argument("--l-extent", type=float, help="Coordinate lattice size")
+    group.add_argument(
+        "--activation",
+        choices=("relu", "leaky_relu"),
+        default="relu",
+        help="Activation (default: %(default)s)",
+    )
+
+
+def check_inputs(args: argparse.Namespace) -> None:
+    if args.z_start:
+        assert args.z_end, "Must provide --z-end with argument --z-start"
+    assert (
+        sum((bool(args.z), bool(args.z_start), bool(args.zfile))) == 1
+    ), "Must specify either -z OR --z-start/--z-end OR --zfile"
+
+
+def main(args: argparse.Namespace) -> None:
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+
+    check_inputs(args)
+    t1 = dt.now()
+
+    # set the device
+    if args.device is not None:
+        device = torch.device(f"cuda:{args.device}")
+    else:
+        use_cuda = torch.cuda.is_available()
+        device = torch.device("cuda" if use_cuda else "cpu")
+        logger.info("Use cuda {}".format(use_cuda))
+        if not use_cuda:
+            logger.warning("WARNING: No GPUs detected")
+
+    logger.info(args)
+    cfg = config.load(args.config)
+    logger.info("Loaded configuration:")
+    pprint.pprint(cfg)
+
+    D = cfg["lattice_args"]["D"]  # image size + 1
+    zdim = cfg["model_args"]["zdim"]
+    norm = [float(x) for x in cfg["dataset_args"]["norm"]]
+
+    if args.downsample:
+        if args.downsample % 2 != 0:
+            raise ValueError(f"Boxsize {args.downsample} is not even!")
+        if args.downsample >= D:
+            raise ValueError(
+                f"New boxsize {args.downsample=} must be "
+                f"smaller than original box size {D=}!"
+            )
+
+    model, lattice = HetOnlyVAE.load(cfg, args.weights, device=device)
+    model.eval()
+
+    # Multiple z
+    if args.z_start or args.zfile:
+        # Get z values
+        if args.z_start:
+            args.z_start = np.array(args.z_start)
+            args.z_end = np.array(args.z_end)
+            z = np.repeat(np.arange(args.n, dtype=np.float32), zdim).reshape(
+                (args.n, zdim)
+            )
+            z *= (args.z_end - args.z_start) / (args.n - 1)  # type: ignore
+            z += args.z_start
+        else:
+            z = np.loadtxt(args.zfile).reshape(-1, zdim)
+
+        os.makedirs(args.o, exist_ok=True)
+        logger.info(f"Generating {len(z)} volumes")
+        for i, zz in enumerate(z, start=args.vol_start_index):
+            logger.info(zz)
+            if isinstance(model.decoder, AFDecoder):
+                if not args.no_volume:
+                    vol, output = model.decoder.eval_volume(
+                            lattice.coords, lattice.D, lattice.extent, norm, zz
+                    )
+                else:
+                    output = model.decoder.structure_decoder(
+                        torch.as_tensor(zz[None], device=lattice.coords.device, dtype=lattice.coords.dtype)
+                    )
+                out_pdb = "{}/{}{:06d}.pdb".format(args.o, args.prefix, i)
+                output = tensor_tree_map(lambda x: np.array(x[-1].detach().cpu()), output)
+
+                logger.info("Writing %s ..."%out_pdb)
+
+                crd = output["final_atom_positions"]
+                crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
+
+                output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
+                   out_pdb )
+
+            else:
+                if args.downsample:
+                    raise
+                    # extent = lattice.extent * (args.downsample / (D - 1))
+                    # decoder = model.decoder
+                    # vol = decoder.eval_volume(
+                    #     lattice.get_downsample_coords(args.downsample + 1),
+                    #     args.downsample + 1,
+                    #     extent,
+                    #     norm,
+                    #     zz,
+                    # )
+                else:
+                    vol = model.decoder.eval_volume(
+                        lattice.coords, lattice.D, lattice.extent, norm, zz
+                    )
+
+            if not args.no_volume: 
+                out_mrc = "{}/{}{:06d}.mrc".format(args.o, args.prefix, i)
+                if args.flip:
+                    vol = vol.flip([0])
+                if args.invert:
+                    vol *= -1
+
+                write_mrc(out_mrc, np.array(vol.cpu()).astype(np.float32), Apix=args.Apix)
+
+    # Single z
+    else:
+        z = np.array(args.z)
+        logger.info(z)
+        if args.downsample:
+            raise
+            # extent = lattice.extent * (args.downsample / (D - 1))
+            # vol = model.decoder.eval_volume(
+            #     lattice.get_downsample_coords(args.downsample + 1),
+            #     args.downsample + 1,
+            #     extent,
+            #     norm,
+            #     z,
+            # )
+        else:
+            vol,output = model.decoder.eval_volume(
+                lattice.coords, lattice.D, lattice.extent, norm, z
+            )
+            out_pdb =args.o + ".pdb"
+            output = tensor_tree_map(lambda x: np.array(x[-1].detach().cpu()), output)
+            crd = output["final_atom_positions"]
+            crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
+            output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
+                out_pdb )
+                
+        if not args.no_volume: 
+            if args.flip:
+                vol = vol.flip([0])
+            if args.invert:
+                vol *= -1
+
+            write_mrc(args.o, np.array(vol.cpu()).astype(np.float32), Apix=args.Apix)
+
+    td = dt.now() - t1
+    logger.info(f"Finished in {td}")
