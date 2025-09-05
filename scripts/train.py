@@ -1005,7 +1005,7 @@ def main(args: argparse.Namespace) -> None:
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
         accelerator="auto",
-        devices=[0],                 # or >1 for multi-GPU
+        devices="auto",                 # or >1 for multi-GPU
         precision=args.precision,  # AMP support
         log_every_n_steps=10,
         callbacks=checkpoint_callback,           # optional callbacks like ModelCheckpoint
