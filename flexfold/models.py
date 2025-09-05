@@ -83,6 +83,7 @@ class HetOnlyVAE(nn.Module):
         real_space = True,
         all_atom=True,
         pair_stack = False,
+        is_multimer=False,
     ):
         super(HetOnlyVAE, self).__init__()
         self.lattice = lattice
@@ -136,6 +137,7 @@ class HetOnlyVAE(nn.Module):
                 all_atom = all_atom,
                 pair_stack = pair_stack,
                 domain = domain,
+                is_multimer=is_multimer,
             )
         else:
             self.decoder = get_decoder(
@@ -203,6 +205,7 @@ class HetOnlyVAE(nn.Module):
             real_space = c["real_space"],
             all_atom = c["all_atom"],
             pair_stack = c["pair_stack"] if "pair_stack" in c else False,
+            is_multimer = c["is_multimer"]
         )
         if weights is not None:
             print(weights)
@@ -1279,9 +1282,10 @@ def get_afdecoder(
         quality_ratio: float = 5.0,
         all_atom: bool = True,
         pair_stack: bool =False,
+        is_multimer: bool =False,
         domain: str = "hartley"
 ):
-    embeddings = torch.load(embedding_path)
+    embeddings = torch.load(embedding_path,map_location='cuda:0')
 
     initial_pose = torch.load(initial_pose_path)
 
@@ -1307,6 +1311,7 @@ def get_afdecoder(
         "all_atom" : all_atom,
         "pair_stack" : pair_stack,
         "domain" : domain,
+        "is_multimer":is_multimer,
     }
 
     if real_space:
@@ -1358,7 +1363,8 @@ class AFDecoder(torch.nn.Module):
                 quality_ratio, 
                 all_atom,
                 pair_stack,
-                domain               
+                domain,
+                is_multimer               
         ):
         super(AFDecoder, self).__init__()
 
@@ -1367,7 +1373,7 @@ class AFDecoder(torch.nn.Module):
         self.loss_config = config.loss
 
         self.structure_module = StructureModule(
-            is_multimer=self.globals.is_multimer,
+            is_multimer=is_multimer,
             **self.config["structure_module"],
         )
 
@@ -1377,41 +1383,44 @@ class AFDecoder(torch.nn.Module):
         self.all_atom = all_atom
         self.pair_stack = pair_stack
         self.domain = domain
+        self.is_multimer=is_multimer
 
         self.register_buffer("rot_init", rot_init)
         self.register_buffer("trans_init", trans_init)
 
+        NUM_RES = "num residues placeholder"
 
         # self.embeddings = embeddings
-        embeddings_keys = [
-            "aatype",
-            "seq_mask",
-            "pair",
-            "single",
-            "final_atom_mask",
-            "final_atom_positions",
-            "residx_atom37_to_atom14",
-            "residx_atom14_to_atom37",
-            "atom37_atom_exists",
-            "atom14_atom_exists",
-            "residue_index",
-        ]
+        embeddings_keys = {
+            "aatype": [NUM_RES],
+            "seq_mask": [NUM_RES],
+            "pair": [NUM_RES, NUM_RES, None],
+            "single": [NUM_RES, None],
+            "final_atom_mask":[NUM_RES, None],
+            "final_atom_positions":[NUM_RES,None, None],
+            "residx_atom37_to_atom14":[NUM_RES, None],
+            "residx_atom14_to_atom37":[NUM_RES, None],
+            "atom37_atom_exists":[NUM_RES, None],
+            "atom14_atom_exists":[NUM_RES, None],
+            "residue_index":[NUM_RES],
+        }
         
-        embeddings = {k: v for k, v in embeddings.items() if k in embeddings_keys}
-        embeddings["all_atom_positions"] = embeddings["final_atom_positions"] 
-        embeddings["all_atom_mask"] = embeddings["final_atom_mask"] 
-        print("\n -- Before : ")
-        for k in embeddings : 
-            print(k)        
+        embeddings = {k: v for k, v in embeddings.items() if k in embeddings_keys.keys()}
+
+        def make_gt(feats):
+            feats["all_atom_positions"] = feats["final_atom_positions"] 
+            feats["all_atom_mask"] = feats["final_atom_mask"] 
+            return feats
+    
         fc = [
+            # data_transforms.make_fixed_size(embeddings_keys,0,0,500,0),
+            make_gt,
             data_transforms.atom37_to_torsion_angles(""),
-            data_transforms.get_chi_angles
-            ]
+            data_transforms.get_chi_angles,
+        ]
         for f in fc:
             embeddings = f(embeddings)
-        print("\n -- After : ")
-        for k in embeddings : 
-            print(k)
+
         self.embeddings = BufferDict(embeddings)
 
         self.res_size = self.embeddings["pair"].shape[-2]

@@ -116,6 +116,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--all_atom", action="store_true", help="TODO"
     )
     parser.add_argument(
+        "--multimer", action="store_true", help="TODO"
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="TODO"
+    )
+    parser.add_argument(
         "--debug", action="store_true", help="TODO"
     )
     parser.add_argument(
@@ -506,6 +512,7 @@ def save_config(args, dataset, lattice, out_config):
         all_atom = args.all_atom,
         pair_stack = args.pair_stack,
         real_space = args.real_space,
+        is_multimer = args.multimer,
     )
     config = dict(
         dataset_args=dataset_args, lattice_args=lattice_args, model_args=model_args
@@ -622,6 +629,7 @@ class LitHetOnlyVAE(pl.LightningModule):
             all_atom=args.all_atom,
             pair_stack=args.pair_stack,
             real_space=args.real_space,
+            is_multimer = args.multimer
         )
 
         self.val_z_mu = []
@@ -950,13 +958,14 @@ def main(args: argparse.Namespace) -> None:
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
-
+    torch.autograd.set_detect_anomaly(True)
     t1 = dt.now()
     if args.outdir is not None and not os.path.exists(args.outdir):
         os.makedirs(args.outdir)
 
     ################################################################################""
-    os.system("rm -rvf %s/*"%args.outdir )
+    if args.overwrite:
+        os.system("rm -rvf %s/*"%args.outdir )
     ################################################################################""
 
 
@@ -996,7 +1005,7 @@ def main(args: argparse.Namespace) -> None:
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
         accelerator="auto",
-        devices="auto",                 # or >1 for multi-GPU
+        devices=[0],                 # or >1 for multi-GPU
         precision=args.precision,  # AMP support
         log_every_n_steps=10,
         callbacks=checkpoint_callback,           # optional callbacks like ModelCheckpoint
