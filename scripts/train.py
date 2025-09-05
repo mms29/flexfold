@@ -758,7 +758,9 @@ class LitHetOnlyVAE(pl.LightningModule):
             plt.close(fig)
 
             fig.savefig(self.args.outdir + "/debug_%s.png"%str(global_it).zfill(5))
-            output_single_pdb(struct["final_atom_positions"], struct["aatype"], struct["final_atom_mask"],
+            output_single_pdb(struct["final_atom_positions"].detach().cpu().numpy(), 
+                              struct["aatype"].detach().cpu().numpy(),
+                            struct["final_atom_mask"].detach().cpu().numpy(),
                               self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5))
 
         loss, gen_loss, kld = self.loss_function(
