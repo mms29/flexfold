@@ -21,32 +21,12 @@ import numpy as np
 import torch
 from cryodrgn import config
 from flexfold.models import HetOnlyVAE, AFDecoder
+from flexfold.core import output_single_pdb
 from openfold.utils.tensor_utils import tensor_tree_map
 
 from cryodrgn.source import write_mrc
-from openfold.np import residue_constants, protein
 
 logger = logging.getLogger(__name__)
-def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
-
-    chain_index = np.zeros_like(aatype)
-    b_factors = np.zeros_like(all_atom_mask)
-    residue_index = np.arange(len(aatype))+1
-
-    pdb_elem = protein.Protein(
-        aatype=aatype,
-        atom_positions=all_atom_positions,
-        atom_mask=all_atom_mask,
-        residue_index=residue_index,
-        b_factors=b_factors,
-        chain_index=chain_index,
-        remark="",
-        parents=None,
-        parents_chain_index=None,
-    )
-    outstring = protein.to_pdb(pdb_elem)
-    with open(file, 'w') as fp:
-        fp.write(outstring)
 
 def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("weights", help="Model weights")

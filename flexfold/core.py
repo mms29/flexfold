@@ -7,6 +7,29 @@ import numpy as np
 
 import tqdm
 
+from openfold.np import residue_constants, protein
+
+def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
+
+    chain_index = np.zeros_like(aatype)
+    b_factors = np.zeros_like(all_atom_mask)
+    residue_index = np.arange(len(aatype))+1
+
+    pdb_elem = protein.Protein(
+        aatype=aatype,
+        atom_positions=all_atom_positions,
+        atom_mask=all_atom_mask,
+        residue_index=residue_index,
+        b_factors=b_factors,
+        chain_index=chain_index,
+        remark="",
+        parents=None,
+        parents_chain_index=None,
+    )
+    outstring = protein.to_pdb(pdb_elem)
+    with open(file, 'w') as fp:
+        fp.write(outstring)
+
 
 def fourier_corr(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
     # normalized complex correlation in Fourier domain 
