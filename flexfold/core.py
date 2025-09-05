@@ -35,12 +35,19 @@ def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
 def struct_to_pdb(struct, file):
     struct = tensor_tree_map(lambda x: x.detach().cpu().numpy, struct)
 
+    aatype=struct["aatype"],
+    atom_positions=struct["final_atom_positions"],
+    atom_mask=struct["final_atom_mask"],
+    residue_index=struct["residue_index"] if "residue_index" in struct else   np.arange(len(aatype))+1,
+    b_factors=struct["plddt"] if "plddt" in struct else np.zeros_like(atom_mask),
+    chain_index=struct["chain_index"] if "chain_index" in struct else  np.zeros_like(aatype),
+
     pdb_elem = protein.Protein(
-        aatype=struct["aatype"],
-        atom_positions=struct["final_atom_positions"],
-        atom_mask=struct["final_atom_mask"],
-        residue_index=struct["residue_index"] if "residue_index" in struct else   np.arange(len(struct["aatype"]))+1,
-        b_factors=struct["plddt"] if "plddt" in struct else np.zeros_like(struct["final_atom_mask"]),
+        aatype=aatype,
+        atom_positions=atom_positions,
+        atom_mask=atom_mask,
+        residue_index=residue_index,
+        b_factors=b_factors,
         chain_index=struct["chain_index"] if "chain_index" in struct else  np.zeros_like(struct["aatype"]),
         remark="",
         parents=None,
