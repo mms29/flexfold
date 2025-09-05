@@ -56,7 +56,7 @@ from flexfold import dataset
 
 from flexfold.models import HetOnlyVAE, AFDecoderReal, AFDecoder, struct_to_crd
 from flexfold.pose import PoseTracker
-from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb
+from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb
 
 logger = logging.getLogger(__name__)
 
@@ -758,10 +758,8 @@ class LitHetOnlyVAE(pl.LightningModule):
             plt.close(fig)
 
             fig.savefig(self.args.outdir + "/debug_%s.png"%str(global_it).zfill(5))
-            output_single_pdb(struct["final_atom_positions"].detach().cpu().numpy(), 
-                              struct["aatype"].detach().cpu().numpy(),
-                            struct["final_atom_mask"].detach().cpu().numpy(),
-                              self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5))
+
+            struct_to_pdb(struct, self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5))
 
         loss, gen_loss, kld = self.loss_function(
             z_mu,

@@ -8,6 +8,7 @@ import numpy as np
 import tqdm
 
 from openfold.np import residue_constants, protein
+from openfold.utils.tensor_utils import tensor_tree_map
 
 def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
 
@@ -29,6 +30,26 @@ def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
     outstring = protein.to_pdb(pdb_elem)
     with open(file, 'w') as fp:
         fp.write(outstring)
+
+
+def struct_to_pdb(struct, file):
+    struct = tensor_tree_map(lambda x: x.detach().cpu().numpy, struct)
+
+    pdb_elem = protein.Protein(
+        aatype=struct["aatype"],
+        atom_positions=struct["final_atom_positions"],
+        atom_mask=struct["final_atom_mask"],
+        residue_index=struct["residue_index"] if "residue_index" in struct else   np.arange(len(struct["aatype"]))+1,
+        b_factors=struct["plddt"] if "plddt" in struct else np.zeros_like(struct["final_atom_mask"]),
+        chain_index=struct["chain_index"] if "chain_index" in struct else  np.zeros_like(struct["aatype"]),
+        remark="",
+        parents=None,
+        parents_chain_index=None,
+    )
+    outstring = protein.to_pdb(pdb_elem)
+    with open(file, 'w') as fp:
+        fp.write(outstring)
+
 
 
 def fourier_corr(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
