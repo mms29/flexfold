@@ -125,6 +125,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--debug", action="store_true", help="TODO"
     )
     parser.add_argument(
+        "--device", type=str, default="auto", help="TODO"
+    )
+    parser.add_argument(
         "--pair_stack", action="store_true", help="TODO"
     )
     parser.add_argument(
@@ -1005,7 +1008,7 @@ def main(args: argparse.Namespace) -> None:
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
         accelerator="auto",
-        devices="auto",                 # or >1 for multi-GPU
+        devices=args.device,                 # or >1 for multi-GPU
         precision=args.precision,  # AMP support
         log_every_n_steps=10,
         callbacks=checkpoint_callback,           # optional callbacks like ModelCheckpoint
