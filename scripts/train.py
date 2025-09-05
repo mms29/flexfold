@@ -719,6 +719,7 @@ class LitHetOnlyVAE(pl.LightningModule):
             if B> 8 : 
                 B=8
             fig, ax = plt.subplots(3, B, layout="constrained", figsize=(30,10))
+            ax = np.array(ax).reshape(3, B) 
 
             masked_overlay = np.zeros((D* D, 4))
             masked_overlay[(mask == 0).detach().cpu().numpy()] = [0, 0, 0, 1]   # Black with full opacity
