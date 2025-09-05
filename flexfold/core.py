@@ -31,16 +31,27 @@ def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
     with open(file, 'w') as fp:
         fp.write(outstring)
 
-
 def struct_to_pdb(struct, file):
-    struct = tensor_tree_map(lambda x: x.detach().cpu().numpy, struct)
+    aatype=struct["aatype"]
 
-    aatype=struct["aatype"],
-    atom_positions=struct["final_atom_positions"],
-    atom_mask=struct["final_atom_mask"],
-    residue_index=struct["residue_index"] if "residue_index" in struct else   np.arange(len(aatype))+1,
-    b_factors=struct["plddt"] if "plddt" in struct else np.zeros_like(atom_mask),
-    chain_index=struct["chain_index"] if "chain_index" in struct else  np.zeros_like(aatype),
+    atom_positions=struct["final_atom_positions"]
+    atom_mask=struct["final_atom_mask"]
+    residue_index=struct["residue_index"] if "residue_index" in struct else   np.arange(len(aatype))+1
+    b_factors=struct["plddt"].repeat(37).reshape(-1,37) if "plddt" in struct else np.zeros_like(atom_mask)
+    chain_index=struct["asym_id"] if "asym_id" in struct else  np.zeros_like(aatype)
+
+    print("aatype")
+    print(aatype)
+    print("atom_positions")
+    print(atom_positions)
+    print("atom_mask")
+    print(atom_mask)
+    print("residue_index")
+    print(residue_index)
+    print("b_factors")
+    print(b_factors)
+    print("chain_index")
+    print(chain_index)
 
     pdb_elem = protein.Protein(
         aatype=aatype,
@@ -48,7 +59,7 @@ def struct_to_pdb(struct, file):
         atom_mask=atom_mask,
         residue_index=residue_index,
         b_factors=b_factors,
-        chain_index=struct["chain_index"] if "chain_index" in struct else  np.zeros_like(struct["aatype"]),
+        chain_index=chain_index,
         remark="",
         parents=None,
         parents_chain_index=None,

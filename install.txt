@@ -19,8 +19,8 @@ pip install cryodrgn
 cd openfold
 scripts/install_third_party_dependencies.sh
 
-cd flexfold
+cd ~/flexfold
 conda activate flexfold
 export PYTHONPATH=~/flexfold:$PYTHONPATH
-export PYTHONPATH=~/flexfold/openfold:$PYTHONPATH
-export PYTHONPATH=~/flexfold/cryodrgn:$PYTHONPATH
+export PYTHONPATH=~/openfold:$PYTHONPATH
+export PYTHONPATH=~/cryodrgn:$PYTHONPATH

@@ -90,3 +90,13 @@ python ./scripts/compute_initial_pose.py $BASE_DIR/initial_pose_000 \
 
 
 python ./scripts/analyze.py -o $RUN_DIR/analysis $RUN_DIR 19 --pc 2
+
+
+
+python ./scripts/train.py $BASE_DIR/000_particles_128.mrcs     \
+ --poses  $BASE_DIR/particles_000.pkl    --ctf $BASE_DIR/ctf_000.pkl     \
+ -n 50     -o $RUN_DIR     --pixel_size 3.0     --sigma 1.05   \
+   --quality_ratio 4.0     --af_decoder     --embedding_path  ~/cryofold/cryobench_IgD/pred2/embeddings.pt     \
+   --initial_pose_path $BASE_DIR/initial_pose_000.pt     --af_checkpoint_path  ../openfold/openfold/resources/params/params_model_3_multimer_v3.npz     \
+   --batch-size 1      --num-workers 0     --zdim 4      --enc-dim 256     --enc-layers 3     --dec-dim 128     --dec-layers 3     --domain hartley     \
+   --overwrite     --multimer     --center_loss_weight 0.0001  --all_atom --debug --device 1

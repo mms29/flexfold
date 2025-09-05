@@ -42,6 +42,10 @@ from openfold.model.template import TemplatePairStack
 from openfold.model.primitives import Linear
 Norm = Sequence[Any]  # mean, std
 
+from openfold.utils.import_weights import import_jax_weights_, import_openfold_weights_
+from openfold.utils.script_utils import get_model_basename
+import os
+from openfold.utils.import_weights import  process_translation_dict, assign, Param, ParamType
 
 def unparallelize(model: nn.Module) -> nn.Module:
     if isinstance(model, DataParallelDecoder):
@@ -76,7 +80,7 @@ class HetOnlyVAE(nn.Module):
         af_decoder = False,
         initial_pose_path = None,
         embedding_path="./output/cryofold/AK_embeddings.pt",
-        af_checkpoint_path = "../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt",
+        af_checkpoint_path = "none",
         sigma = 2.5,
         pixel_size = 2.2,
         quality_ratio = 5,
@@ -1289,8 +1293,12 @@ def get_afdecoder(
 
     initial_pose = torch.load(initial_pose_path)
 
+
+    config_preset = get_model_basename(af_checkpoint_path)
+    config_preset = config_preset[7:] if config_preset.startswith("params_") else config_preset
+
     config = model_config(
-        "initial_training", 
+        config_preset, 
         train=True, 
         low_prec=False,
     ) 
@@ -1319,11 +1327,8 @@ def get_afdecoder(
     else:
         model = AFDecoder(**afdecoder_args)
 
-    model = resume_ckpt(
-        af_checkpoint_path, 
-        model, 
-        config
-    )
+    model = import_weights(model,af_checkpoint_path)
+
     return model
 
 class BufferDict(nn.Module):
@@ -1403,8 +1408,10 @@ class AFDecoder(torch.nn.Module):
             "atom37_atom_exists":[NUM_RES, None],
             "atom14_atom_exists":[NUM_RES, None],
             "residue_index":[NUM_RES],
+            "asym_id": [NUM_RES],
         }
-        
+    
+
         embeddings = {k: v for k, v in embeddings.items() if k in embeddings_keys.keys()}
 
         def make_gt(feats):
@@ -1425,7 +1432,6 @@ class AFDecoder(torch.nn.Module):
 
         self.res_size = self.embeddings["pair"].shape[-2]
         self.outdim = self.embeddings["pair"].shape[-1]
-
 
         self.zdim = zdim
 
@@ -1670,11 +1676,193 @@ class AFDecoderReal(AFDecoder):
         return y_recon, struct, y_recon_real
 
 
-def resume_ckpt(resume_from_ckpt, model, config):
-    sd = torch.load(resume_from_ckpt)
-    if "model_state_dict" not in sd :
-        sd = convert_deprecated_v1_keys(sd)
-        incompatible_keys = model.load_state_dict(sd, strict=False)
+
+def import_weights(model, ckpt_path):
+    ext = os.path.splitext(ckpt_path)[1] 
+
+    if ext == ".npz":
+        model_basename = get_model_basename(ckpt_path)
+        model_version = "_".join(model_basename.split("_")[1:])
+        import_jax_weights_sm(
+            model, ckpt_path, version=model_version
+        )
+    elif ext == ".pt":
+        d = torch.load(ckpt_path)
+
+        if "ema" in d:
+            # The public weights have had this done to them already
+            d = d["ema"]["params"]
+        import_openfold_weights_sm(model=model, state_dict=d)
     else:
-        model.load_state_dict(sd["model_state_dict"], strict=False)
+        raise
     return model
+
+
+def import_openfold_weights_sm(model, state_dict):
+    try:
+        model.load_state_dict(state_dict, strict=False)
+    except RuntimeError:
+        converted_state_dict = convert_deprecated_v1_keys(state_dict)
+        model.load_state_dict(converted_state_dict, strict=False)
+
+
+def import_jax_weights_sm(model, npz_path, version="model_1"):
+    data = np.load(npz_path)
+    translations = generate_translation_dict_sm(model, version, is_multimer=("multimer" in version))
+
+    # Flatten keys and insert missing key prefixes
+    flat = process_translation_dict(translations)
+
+    # Sanity check
+    keys = list(data.keys())
+    flat_keys = list(flat.keys())
+    incorrect = [k for k in flat_keys if k not in keys]
+    missing = [k for k in keys if k not in flat_keys]
+    # print(f"Incorrect: {incorrect}")
+    # print(f"Missing: {missing}")
+
+    assert len(incorrect) == 0
+    # assert(sorted(list(flat.keys())) == sorted(list(data.keys())))
+
+    # Set weights
+    assign(flat, data)
+
+def generate_translation_dict_sm(model, version, is_multimer=False):
+
+    LinearWeight = lambda l: (Param(l, param_type=ParamType.LinearWeight))
+    LinearBias = lambda l: (Param(l))
+    LinearWeightMHA = lambda l: (Param(l, param_type=ParamType.LinearWeightMHA))
+    LinearBiasMHA = lambda b: (Param(b, param_type=ParamType.LinearBiasMHA))
+
+    LinearParams = lambda l: {
+        "weights": LinearWeight(l.weight),
+        "bias": LinearBias(l.bias),
+    }
+
+    LinearParamsMHA = lambda l: {
+        "weights": LinearWeightMHA(l.weight),
+        "bias": LinearBiasMHA(l.bias),
+    }
+
+    LayerNormParams = lambda l: {
+        "scale": Param(l.weight),
+        "offset": Param(l.bias),
+    }
+
+    IPAParams = lambda ipa: {
+        "q_scalar": LinearParams(ipa.linear_q),
+        "kv_scalar": LinearParams(ipa.linear_kv),
+        "q_point_local": LinearParams(ipa.linear_q_points.linear),
+        "kv_point_local": LinearParams(ipa.linear_kv_points.linear),
+        "trainable_point_weights": Param(
+            param=ipa.head_weights, param_type=ParamType.Other
+        ),
+        "attention_2d": LinearParams(ipa.linear_b),
+        "output_projection": LinearParams(ipa.linear_out),
+    }
+
+    PointProjectionParams = lambda pp: {
+        "point_projection": LinearParamsMHA(
+            pp.linear,
+        ),
+    }
+
+    IPAParamsMultimer = lambda ipa: {
+        "q_scalar_projection": {
+            "weights": LinearWeightMHA(
+                ipa.linear_q.weight,
+            ),
+        },
+        "k_scalar_projection": {
+            "weights": LinearWeightMHA(
+                ipa.linear_k.weight,
+            ),
+        },
+        "v_scalar_projection": {
+            "weights": LinearWeightMHA(
+                ipa.linear_v.weight,
+            ),
+        },
+        "q_point_projection": PointProjectionParams(
+            ipa.linear_q_points
+        ),
+        "k_point_projection": PointProjectionParams(
+            ipa.linear_k_points
+        ),
+        "v_point_projection": PointProjectionParams(
+            ipa.linear_v_points
+        ),
+        "trainable_point_weights": Param(
+            param=ipa.head_weights, param_type=ParamType.Other
+        ),
+        "attention_2d": LinearParams(ipa.linear_b),
+        "output_projection": LinearParams(ipa.linear_out),
+    }
+
+    def FoldIterationParams(sm):
+        d = {
+            "invariant_point_attention": 
+                IPAParamsMultimer(sm.ipa) if is_multimer else IPAParams(sm.ipa),
+            "attention_layer_norm": LayerNormParams(sm.layer_norm_ipa),
+            "transition": LinearParams(sm.transition.layers[0].linear_1),
+            "transition_1": LinearParams(sm.transition.layers[0].linear_2),
+            "transition_2": LinearParams(sm.transition.layers[0].linear_3),
+            "transition_layer_norm": LayerNormParams(sm.transition.layer_norm),
+            "affine_update": LinearParams(sm.bb_update.linear),
+            "rigid_sidechain": {
+                "input_projection": LinearParams(sm.angle_resnet.linear_in),
+                "input_projection_1": 
+                    LinearParams(sm.angle_resnet.linear_initial),
+                "resblock1": LinearParams(sm.angle_resnet.layers[0].linear_1),
+                "resblock2": LinearParams(sm.angle_resnet.layers[0].linear_2),
+                "resblock1_1": 
+                    LinearParams(sm.angle_resnet.layers[1].linear_1),
+                "resblock2_1": 
+                    LinearParams(sm.angle_resnet.layers[1].linear_2),
+                "unnormalized_angles": 
+                    LinearParams(sm.angle_resnet.linear_out),
+            },
+        }
+
+        if(is_multimer):
+            d.pop("affine_update")
+            d["quat_rigid"] = {
+                "rigid": LinearParams(
+                   sm.bb_update.linear
+                )
+            }
+
+        return d
+
+    if(not is_multimer):
+        translations = {
+            "structure_module": {
+                "single_layer_norm": LayerNormParams(
+                    model.structure_module.layer_norm_s
+                ),
+                "initial_projection": LinearParams(
+                    model.structure_module.linear_in
+                ),
+                "pair_layer_norm": LayerNormParams(
+                    model.structure_module.layer_norm_z
+                ),
+                "fold_iteration": FoldIterationParams(model.structure_module),
+            },
+        }
+    else:
+        translations = {
+            "structure_module": {
+                "single_layer_norm": LayerNormParams(
+                    model.structure_module.layer_norm_s
+                ),
+                "initial_projection": LinearParams(
+                    model.structure_module.linear_in
+                ),
+                "pair_layer_norm": LayerNormParams(
+                    model.structure_module.layer_norm_z
+                ),
+                "fold_iteration": FoldIterationParams(model.structure_module),
+            },
+        }
+    return translations
+

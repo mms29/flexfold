@@ -632,7 +632,8 @@ class LitHetOnlyVAE(pl.LightningModule):
             all_atom=args.all_atom,
             pair_stack=args.pair_stack,
             real_space=args.real_space,
-            is_multimer = args.multimer
+            is_multimer = args.multimer,
+            af_checkpoint_path =args.af_checkpoint_path,
         )
 
         self.val_z_mu = []
@@ -759,7 +760,8 @@ class LitHetOnlyVAE(pl.LightningModule):
 
             fig.savefig(self.args.outdir + "/debug_%s.png"%str(global_it).zfill(5))
 
-            struct_to_pdb(struct, self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5))
+            struct_to_pdb(tensor_tree_map(lambda x: x.detach().cpu().numpy()[-1], struct),
+                           self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5))
 
         loss, gen_loss, kld = self.loss_function(
             z_mu,
