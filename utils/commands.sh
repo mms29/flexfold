@@ -41,7 +41,7 @@ python animate_trajectory.py $RUN_DIR/analysis/animate_pc4.cxc --pc_ind 4 --nres
 
 
 BASE_DIR="../cryofold/cryobench_IgD/IgG-1D/images/snr0.01"
-RUN_DIR=$BASE_DIR/run2
+RUN_DIR=$BASE_DIR/run
 
 cryodrgn parse_ctf_star $BASE_DIR/particles_*.star -o $BASE_DIR/ctf.pkl
 cryodrgn parse_pose_star $BASE_DIR/particles_*.star -o $BASE_DIR/particles.pkl
@@ -49,36 +49,62 @@ cryodrgn backproject_voxel $BASE_DIR/sorted_particles.128.txt  --poses $BASE_DIR
 
 
 python ./scripts/compute_initial_pose.py $BASE_DIR/initial_pose \
- --from_aligned_pdb ~/cryofold/cryobench_IgD/pred2/aligned.pdb --alignment_reference ~/cryofold/cryobench_IgD/pred2/unrelaxed.pdb  --overwrite
+ --from_aligned_pdb data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/backproject/aligned_target_fit.pdb \
+ --alignment_reference data//cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run_target/fit.4000.pdb  --overwrite
+
 
 nohup \
-python ./scripts/train.py $BASE_DIR/000_particles_128.mrcs  \
-    --poses  $BASE_DIR/particles_000.pkl\
-    --ctf $BASE_DIR/ctf_000.pkl \
-    -n 50 \
+python ./scripts/train.py $BASE_DIR/sorted_particles.128.txt  \
+    --poses  $BASE_DIR/particles.pkl\
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
     -o $RUN_DIR \
     --pixel_size 3.0 \
     --sigma 1.05 \
-    --quality_ratio 4.0 \
+    --quality_ratio 5.0 \
     --af_decoder \
-    --embedding_path  ~/cryofold/cryobench_IgD/pred2/embeddings.pt \
+    --embedding_path ~/cryofold/cryobench_IgD/pred2/embeddings.pt  \
     --initial_pose_path $BASE_DIR/initial_pose_000.pt \
-    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/params/params_model_3_multimer_v3.npz \
     --batch-size 1  \
     --num-workers 0 \
     --zdim 4  \
     --enc-dim 256 \
     --enc-layers 3 \
-    --dec-dim 128 \
+    --dec-dim 256 \
     --dec-layers 3 \
-    --domain hartley \
+    --domain fourier \
+    --load ~/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run_target/weights.4000.pkl \
     --overwrite \
     --multimer \
-    --center_loss_weight 0.0001\
-    --debug \
-    > log.txt &
-    # --all_atom \
+    --center_loss_weight 0.01    \
+> log.txt &\
+disown
 
+
+python ./scripts/train_target.py $BASE_DIR/sorted_particles.128.txt  \
+    --poses  $BASE_DIR/particles.pkl\
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 3.0 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --af_decoder \
+    --embedding_path ~/cryofold/cryobench_IgD/pred2/embeddings.pt  \
+    --initial_pose_path $BASE_DIR/initial_pose_000.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/params/params_model_3_multimer_v3.npz \
+    --batch-size 1  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 256 \
+    --enc-layers 3 \
+    --dec-dim 256 \
+    --dec-layers 3 \
+    --domain fourier \
+    --overwrite \
+    --multimer \
+    --center_loss_weight 0.01\
 
 
 cryodrgn parse_ctf_star $BASE_DIR/snr0.01_000.star -o $BASE_DIR/ctf_000.pkl
@@ -89,7 +115,7 @@ python ./scripts/compute_initial_pose.py $BASE_DIR/initial_pose_000 \
  --from_aligned_pdb ~/cryofold/cryobench_IgD/pred2/aligned.pdb --alignment_reference ~/cryofold/cryobench_IgD/pred2/unrelaxed.pdb  --overwrite
 
 
-python ./scripts/analyze.py -o $RUN_DIR/analysis $RUN_DIR 19 --pc 2
+python ./scripts/analyze.py -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2
 
 
 
@@ -100,3 +126,6 @@ python ./scripts/train.py $BASE_DIR/000_particles_128.mrcs     \
    --initial_pose_path $BASE_DIR/initial_pose_000.pt     --af_checkpoint_path  ../openfold/openfold/resources/params/params_model_3_multimer_v3.npz     \
    --batch-size 1      --num-workers 0     --zdim 4      --enc-dim 256     --enc-layers 3     --dec-dim 128     --dec-layers 3     --domain hartley     \
    --overwrite     --multimer     --center_loss_weight 0.0001  --all_atom --debug --device 1
+
+
+

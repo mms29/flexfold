@@ -57,6 +57,7 @@ from flexfold import dataset
 from flexfold.models import HetOnlyVAE, AFDecoderReal, AFDecoder, struct_to_crd
 from flexfold.pose import PoseTracker
 from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb
+from pytorch_lightning.strategies import DDPStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -524,21 +525,6 @@ def save_config(args, dataset, lattice, out_config):
     cryodrgn.config.save(config, out_config)
 
 
-def get_latest(args):
-    # assumes args.num_epochs > latest checkpoint
-    logger.info("Detecting latest checkpoint...")
-    weights = [f"{args.outdir}/weights.{i}.pkl" for i in range(args.num_epochs)]
-    weights = [f for f in weights if os.path.exists(f)]
-    args.load = weights[-1]
-    logger.info(f"Loading {args.load}")
-    if args.do_pose_sgd:
-        i = args.load.split(".")[-2]
-        args.poses = f"{args.outdir}/pose.{i}.pkl"
-        assert os.path.exists(args.poses)
-        logger.info(f"Loading {args.poses}")
-    return args
-
-
 
 class LitHetOnlyVAE(pl.LightningModule):
     def __init__(self, args, D,Nparticles):
@@ -980,10 +966,7 @@ def main(args: argparse.Namespace) -> None:
 
 
     logger.addHandler(logging.FileHandler(f"{args.outdir}/run.log"))
-    if args.load == "latest":
-        args = get_latest(args)
     logger.info(" ".join(sys.argv))
-    logger.info(f"cryoDRGN {__version__}")
     logger.info(args)
 
     # set the random seed ------------------------------------------------------------------------------------------------------------------------
@@ -998,31 +981,40 @@ def main(args: argparse.Namespace) -> None:
     # load model ------------------------------------------------------------------------------------------------------------------------
     model = LitHetOnlyVAE(args, datamodule.train_data.D, datamodule.train_data.N)
 
+    if args.load:
+        logger.info("Loading checkpoint from {}".format(args.load))
+        checkpoint = torch.load(args.load)
+        model.model.load_state_dict(checkpoint["model_state_dict"])
+        optim = model.configure_optimizers()
+        optim.load_state_dict(checkpoint["optimizer_state_dict"])
+        logger.info("Successfully restored states from {}".format(args.load))
+
     # save configuration
     out_config = "{}/config.yaml".format(args.outdir)
     save_config(args, datamodule.train_data, model.model.lattice, out_config)
 
-    checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        dirpath=args.outdir,          # where to save
-        filename="ckpt",  # filename pattern
-        monitor="loss",              # what metric to track
-        save_top_k=3,                    # save the 3 best models
-        mode="min",                      # "min" for loss, "max" for accuracy, etc.
-        save_last=False,                  # also save 'last.ckpt'
-        verbose=True,
-    )
-
+    # checkpoint_callback = pl.callbacks.ModelCheckpoint(
+    #     dirpath=args.outdir,          # where to save
+    #     filename="ckpt",  # filename pattern
+    #     monitor="loss",              # what metric to track
+    #     save_top_k=3,                    # save the 3 best models
+    #     mode="min",                      # "min" for loss, "max" for accuracy, etc.
+    #     save_last=False,                  # also save 'last.ckpt'
+    #     verbose=True,
+    # )
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
         accelerator="auto",
+        strategy=DDPStrategy(process_group_backend="gloo"),
+        # strategy=DDPStrategy(),
         devices=args.device,                 # or >1 for multi-GPU
         precision=args.precision,  # AMP support
         log_every_n_steps=10,
-        callbacks=checkpoint_callback,           # optional callbacks like ModelCheckpoint
+        callbacks=None,           # optional callbacks like ModelCheckpoint
         logger=CSVLogger(args.outdir, name="", version="")
     )
 
-    trainer.fit(model, datamodule=datamodule, ckpt_path=args.load)
+    trainer.fit(model, datamodule=datamodule)
 
 
 

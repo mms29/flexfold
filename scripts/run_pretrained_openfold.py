@@ -54,6 +54,10 @@ from openfold.utils.trace_utils import (
 from scripts.precompute_embeddings import EmbeddingGenerator
 from scripts.utils import add_data_args
 
+from openfold.data import mmcif_parsing
+from openfold.data.data_pipeline import add_assembly_features, make_sequence_features, convert_monomer_features
+from openfold.model.model import AlphaFold
+from flexfold.core import output_single_pdb
 
 TRACING_INTERVAL = 50
 
@@ -278,6 +282,9 @@ def main(args):
         raise ValueError(
             '`openfold_checkpoint_path` was specified, but no OpenFold checkpoints are available for multimer mode')
 
+    ###################################################
+    config.data.common.max_recycling_iters = 50
+
     model_generator = load_models_from_command_line(
         config,
         args.model_device,
@@ -318,6 +325,10 @@ def main(args):
                 feature_dict, mode='predict', is_multimer=is_multimer
             )
 
+            target_feats = get_target_feats("../cryofold/cryobench_IgD/1HZH.cif", data_processor)
+            model.__class__ = AlphaFoldTargeted
+            model.target_pos = torch.as_tensor(target_feats["all_atom_positions"], device=args.model_device)
+
             processed_feature_dict = {
                 k: torch.as_tensor(v, device=args.model_device)
                 for k, v in processed_feature_dict.items()
@@ -335,10 +346,6 @@ def main(args):
                         f"Tracing time: {tracing_time}"
                     )
                     cur_tracing_interval = rounded_seqlen
-
-            print("is multimer ??")
-            print(is_multimer)
-            print(processed_feature_dict["aatype"].shape)
 
             out = run_model(model, processed_feature_dict, tag, args.output_dir)
 
@@ -411,6 +418,127 @@ def main(args):
                     pickle.dump(out, fp, protocol=pickle.HIGHEST_PROTOCOL)
 
                 logger.info(f"Model output written to {output_dict_path}...")
+
+class AlphaFoldTargeted(AlphaFold):
+    def forward(self, batch):
+        target_pos = self.target_pos
+    
+        # Initialize recycling embeddings
+        m_1_prev, z_prev, x_prev = None, None, target_pos
+        prevs = [m_1_prev, z_prev, x_prev]
+
+        is_grad_enabled = torch.is_grad_enabled()
+
+        # Main recycling loop
+        num_iters = batch["aatype"].shape[-1]
+        early_stop = False
+        num_recycles = 0
+        for cycle_no in range(num_iters):
+            # Select the features for the current recycling cycle
+            fetch_cur_batch = lambda t: t[..., cycle_no]
+            feats = tensor_tree_map(fetch_cur_batch, batch)
+
+            # Enable grad iff we're training and it's the final recycling layer
+            is_final_iter = cycle_no == (num_iters - 1) or early_stop
+            with torch.set_grad_enabled(is_grad_enabled and is_final_iter):
+                if is_final_iter:
+                    # Sidestep AMP bug (PyTorch issue #65766)
+                    if torch.is_autocast_enabled():
+                        torch.clear_autocast_cache()
+
+                # Run the next iteration of the model
+                print("ITER %i"%cycle_no)
+                outputs, m_1_prev, z_prev, x_prev, early_stop = self.iteration(
+                    feats,
+                    prevs,
+                    _recycle=(num_iters > 1)
+                )
+                
+                fileout = "data/cryofold/cryobench_IgD/test/predictions/iter%s_pred.pdb"%str(num_recycles+1).zfill(3)
+                output_single_pdb(
+                    all_atom_positions = outputs["final_atom_positions"].detach().cpu().numpy(),
+                    aatype=feats["aatype"].detach().cpu().numpy(), 
+                    all_atom_mask= outputs["final_atom_mask"].detach().cpu().numpy(), 
+                    file=fileout, 
+                    chain_index=feats["asym_id"].detach().cpu().numpy(), 
+                    residue_index=feats["residue_index"].detach().cpu().numpy()
+                    )
+                fileout = "data/cryofold/cryobench_IgD/test/predictions/iter%s_prev.pdb"%str(num_recycles+1).zfill(3)
+                output_single_pdb(
+                    all_atom_positions = target_pos.detach().cpu().numpy(),
+                    aatype=feats["aatype"].detach().cpu().numpy(), 
+                    all_atom_mask= outputs["final_atom_mask"].detach().cpu().numpy(), 
+                    file=fileout, 
+                    chain_index=feats["asym_id"].detach().cpu().numpy(), 
+                    residue_index=feats["residue_index"].detach().cpu().numpy()
+                    )
+                num_recycles += 1
+
+                if not is_final_iter:
+                    del outputs
+                    prevs = [m_1_prev, z_prev, target_pos]
+                    del m_1_prev, z_prev, x_prev
+                else:
+                    break
+
+        outputs["num_recycles"] = torch.tensor(num_recycles, device=feats["aatype"].device)
+
+        if "asym_id" in batch:
+            outputs["asym_id"] = feats["asym_id"]
+
+        # Run auxiliary heads
+        outputs.update(self.aux_heads(outputs))
+
+        return outputs
+
+
+
+def get_target_feats(mmcif_file,data_processor):
+
+    with open(mmcif_file, 'r') as f:
+        mmcif_string = f.read()
+
+    mmcif_object = mmcif_parsing.parse(
+        file_id="1HZH", mmcif_string=mmcif_string
+    )
+
+    # Crash if an error is encountered. Any parsing errors should have
+    # been dealt with at the alignment stage.
+    if mmcif_object.mmcif_object is None:
+        raise list(mmcif_object.errors.values())[0]
+
+    mmcif_object = mmcif_object.mmcif_object
+
+    all_chain_features = {}
+    for chain_id, seq in mmcif_object.chain_to_seqres.items():
+        desc= "_".join([mmcif_object.file_id, chain_id])
+        input_sequence = mmcif_object.chain_to_seqres[chain_id]
+        num_res = len(input_sequence)
+
+        mmcif_feats = {}
+
+        mmcif_feats.update(
+            make_sequence_features(
+                sequence=input_sequence,
+                description=desc,
+                num_res=num_res,
+            )
+        )
+        mmcif_feats.update(data_processor.get_mmcif_features(mmcif_object, chain_id))
+
+        mmcif_feats = convert_monomer_features(
+            mmcif_feats,
+            chain_id=desc
+        )
+
+        all_chain_features[desc] = mmcif_feats
+
+    all_chain_features = add_assembly_features(all_chain_features)
+
+    merge_feats = {}
+    for f in ["asym_id","all_atom_positions","all_atom_mask","residue_index","aatype"]:
+        merge_feats[f] = np.concatenate([v[f] for k,v in all_chain_features.items()], axis=0)
+    return merge_feats
 
 
 if __name__ == "__main__":

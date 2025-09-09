@@ -47,6 +47,12 @@ from openfold.utils.script_utils import get_model_basename
 import os
 from openfold.utils.import_weights import  process_translation_dict, assign, Param, ParamType
 
+from openfold.data import mmcif_parsing
+from openfold.data.data_pipeline import add_assembly_features, make_sequence_features, convert_monomer_features
+from openfold.model.model import AlphaFold
+from flexfold.core import output_single_pdb
+from openfold.data.data_pipeline import  DataPipelineMultimer, DataPipeline
+
 def unparallelize(model: nn.Module) -> nn.Module:
     if isinstance(model, DataParallelDecoder):
         return model.dp.module
@@ -87,6 +93,7 @@ class HetOnlyVAE(nn.Module):
         real_space = True,
         all_atom=True,
         pair_stack = False,
+        target_file=None,
         is_multimer=False,
     ):
         super(HetOnlyVAE, self).__init__()
@@ -140,6 +147,7 @@ class HetOnlyVAE(nn.Module):
                 quality_ratio=quality_ratio,
                 all_atom = all_atom,
                 pair_stack = pair_stack,
+                target_file=target_file,
                 domain = domain,
                 is_multimer=is_multimer,
             )
@@ -209,6 +217,7 @@ class HetOnlyVAE(nn.Module):
             real_space = c["real_space"],
             all_atom = c["all_atom"],
             pair_stack = c["pair_stack"] if "pair_stack" in c else False,
+            target_file= c["target_file"] if "target_file" in c else None,
             is_multimer = c["is_multimer"]
         )
         if weights is not None:
@@ -1286,16 +1295,20 @@ def get_afdecoder(
         quality_ratio: float = 5.0,
         all_atom: bool = True,
         pair_stack: bool =False,
+        target_file: str=None,
         is_multimer: bool =False,
         domain: str = "hartley"
 ):
-    embeddings = torch.load(embedding_path,map_location='cuda:0')
+    embeddings = torch.load(embedding_path,map_location="cpu")
 
     initial_pose = torch.load(initial_pose_path)
 
 
     config_preset = get_model_basename(af_checkpoint_path)
-    config_preset = config_preset[7:] if config_preset.startswith("params_") else config_preset
+    if config_preset.startswith("params_") :
+         config_preset[7:]
+    elif len(config_preset) >= 2 and config_preset[-2] == "_" and config_preset[-1].isdigit():
+        config_preset = config_preset[:-2]
 
     config = model_config(
         config_preset, 
@@ -1318,6 +1331,7 @@ def get_afdecoder(
         "quality_ratio":quality_ratio,
         "all_atom" : all_atom,
         "pair_stack" : pair_stack,
+        "target_file": target_file,
         "domain" : domain,
         "is_multimer":is_multimer,
     }
@@ -1368,6 +1382,7 @@ class AFDecoder(torch.nn.Module):
                 quality_ratio, 
                 all_atom,
                 pair_stack,
+                target_file,
                 domain,
                 is_multimer               
         ):
@@ -1387,6 +1402,7 @@ class AFDecoder(torch.nn.Module):
         self.lattice_size=lattice_size
         self.all_atom = all_atom
         self.pair_stack = pair_stack
+        self.target_file=target_file
         self.domain = domain
         self.is_multimer=is_multimer
 
@@ -1414,15 +1430,26 @@ class AFDecoder(torch.nn.Module):
 
         embeddings = {k: v for k, v in embeddings.items() if k in embeddings_keys.keys()}
 
+        if target_file is not None:
+            target_feats = get_target_feats(
+                target_file, 
+                DataPipelineMultimer(DataPipeline(None)) if is_multimer else DataPipeline(None)
+            )
+
+
         def make_gt(feats):
-            feats["all_atom_positions"] = feats["final_atom_positions"] 
+            feats["all_atom_positions"] = torch.tensor(target_feats ["all_atom_positions"]) if target_file is not None else feats["final_atom_positions"] 
             feats["all_atom_mask"] = feats["final_atom_mask"] 
             return feats
     
         fc = [
             # data_transforms.make_fixed_size(embeddings_keys,0,0,500,0),
             make_gt,
+            data_transforms.make_atom14_positions,
+            data_transforms.atom37_to_frames,
             data_transforms.atom37_to_torsion_angles(""),
+            data_transforms.make_pseudo_beta(""),
+            data_transforms.get_backbone_frames,
             data_transforms.get_chi_angles,
         ]
         for f in fc:
@@ -1463,7 +1490,6 @@ class AFDecoder(torch.nn.Module):
         print("\t pair_stack : %s"%str(pair_stack))
         print("\t integration diameter set to %i"%((self.n_pix_cutoff)))
         print("--\n")
-
 
     def forward(self, crd_lattice, z):
 
@@ -1866,3 +1892,50 @@ def generate_translation_dict_sm(model, version, is_multimer=False):
         }
     return translations
 
+
+def get_target_feats(mmcif_file,data_processor):
+
+    with open(mmcif_file, 'r') as f:
+        mmcif_string = f.read()
+
+    mmcif_object = mmcif_parsing.parse(
+        file_id="1HZH", mmcif_string=mmcif_string
+    )
+
+    # Crash if an error is encountered. Any parsing errors should have
+    # been dealt with at the alignment stage.
+    if mmcif_object.mmcif_object is None:
+        raise list(mmcif_object.errors.values())[0]
+
+    mmcif_object = mmcif_object.mmcif_object
+
+    all_chain_features = {}
+    for chain_id, seq in mmcif_object.chain_to_seqres.items():
+        desc= "_".join([mmcif_object.file_id, chain_id])
+        input_sequence = mmcif_object.chain_to_seqres[chain_id]
+        num_res = len(input_sequence)
+
+        mmcif_feats = {}
+
+        mmcif_feats.update(
+            make_sequence_features(
+                sequence=input_sequence,
+                description=desc,
+                num_res=num_res,
+            )
+        )
+        mmcif_feats.update(data_processor.get_mmcif_features(mmcif_object, chain_id))
+
+        mmcif_feats = convert_monomer_features(
+            mmcif_feats,
+            chain_id=desc
+        )
+
+        all_chain_features[desc] = mmcif_feats
+
+    all_chain_features = add_assembly_features(all_chain_features)
+
+    merge_feats = {}
+    for f in ["asym_id","all_atom_positions","all_atom_mask","residue_index","aatype"]:
+        merge_feats[f] = np.concatenate([v[f] for k,v in all_chain_features.items()], axis=0)
+    return merge_feats

@@ -10,11 +10,13 @@ import tqdm
 from openfold.np import residue_constants, protein
 from openfold.utils.tensor_utils import tensor_tree_map
 
-def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file):
+def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file, chain_index=None, residue_index=None):
 
-    chain_index = np.zeros_like(aatype)
+    if chain_index is None:
+        chain_index = np.zeros_like(aatype)
     b_factors = np.zeros_like(all_atom_mask)
-    residue_index = np.arange(len(aatype))+1
+    if residue_index is None:
+        residue_index = np.arange(len(aatype))+1
 
     pdb_elem = protein.Protein(
         aatype=aatype,
@@ -39,19 +41,6 @@ def struct_to_pdb(struct, file):
     residue_index=struct["residue_index"] if "residue_index" in struct else   np.arange(len(aatype))+1
     b_factors=struct["plddt"].repeat(37).reshape(-1,37) if "plddt" in struct else np.zeros_like(atom_mask)
     chain_index=struct["asym_id"] if "asym_id" in struct else  np.zeros_like(aatype)
-
-    print("aatype")
-    print(aatype)
-    print("atom_positions")
-    print(atom_positions)
-    print("atom_mask")
-    print(atom_mask)
-    print("residue_index")
-    print(residue_index)
-    print("b_factors")
-    print(b_factors)
-    print("chain_index")
-    print(chain_index)
 
     pdb_elem = protein.Protein(
         aatype=aatype,
