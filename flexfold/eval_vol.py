@@ -230,7 +230,7 @@ def main(args: argparse.Namespace) -> None:
                 crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
 
                 output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
-                   out_pdb )
+                   out_pdb, chain_index=output["asym_id"] if "asym_id" in output else None, residue_index=output["residue_index"])
 
             else:
                 if args.downsample:
@@ -281,7 +281,7 @@ def main(args: argparse.Namespace) -> None:
             crd = output["final_atom_positions"]
             crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
             output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
-                out_pdb )
+                out_pdb , chain_index=output["asym_id"], residue_index=output["residue_index"])
                 
         if not args.no_volume: 
             if args.flip:

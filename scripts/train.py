@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DataParallel
 import torch.nn.functional as F
+from pytorch_lightning.plugins.environments import MPIEnvironment
 
 try:
     import apex.amp as amp  # type: ignore  # PYR01
@@ -56,8 +57,11 @@ from flexfold import dataset
 
 from flexfold.models import HetOnlyVAE, AFDecoderReal, AFDecoder, struct_to_crd
 from flexfold.pose import PoseTracker
-from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb
+from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb,weighted_normalized_l2, gaussian_weight, frequency_weights
 from pytorch_lightning.strategies import DDPStrategy
+from scipy.ndimage import gaussian_filter
+from flexfold.core import ifft2_center
+
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +101,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--real_space", action="store_true", help="TODO"
+    )        
+    parser.add_argument(
+        "--mpi_plugin", action="store_true", help="TODO"
     )    
+    
     parser.add_argument(
         "--quality_ratio", type=float, default=5.0, help="TODO"
     )
@@ -126,7 +134,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--debug", action="store_true", help="TODO"
     )
     parser.add_argument(
-        "--device", type=str, default="auto", help="TODO"
+        "--devices", type=str, default="auto", help="TODO"
+    )
+    parser.add_argument(
+        "--num_nodes", type=int, default=1, help="TODO"
     )
     parser.add_argument(
         "--pair_stack", action="store_true", help="TODO"
@@ -430,44 +441,6 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
     return parser
 
-def run_encoder(model, y, c=None):
-    input_ = (y,)
-    if c is not None:
-        input_ = (x * c.sign() for x in input_)  # phase flip by the ctf
-
-    z_mu, z_logvar = model.encode(*input_)
-
-    return z_mu, z_logvar 
-
-def run_decoder(model, lattice, z_mu, z_logvar, rot, ntilts: Optional[int], c=None):
-    B = z_mu.size(0)
- 
-    z = model.reparameterize(z_mu, z_logvar)
-    if ntilts is not None:
-        z = torch.repeat_interleave(z, ntilts, dim=0)
-
-    # decode
-    mask = lattice.get_circular_mask(lattice.D // 2)  # restrict to circular mask
-
-    if isinstance(model.decoder, AFDecoderReal):
-        y_recon, struct, y_recon_real = model(rot, z)
-        y_recon =  y_recon.view(B, -1)[..., mask]
-    elif isinstance(model.decoder, AFDecoder):
-        y_recon, struct = model(lattice.coords[mask] / lattice.extent / 2 @ rot, z)
-    else:
-        y_recon = model(lattice.coords[mask] / lattice.extent / 2 @ rot, z)
-
-    y_recon = y_recon.view(B, -1)
-    if c is not None:
-        y_recon *= c.view(B, -1)[:, mask]
-
-
-    return z, y_recon, mask, struct,# y_tmp, y_recon_real
-
-
-
-
-
 def save_config(args, dataset, lattice, out_config):
     dataset_args = dict(
         particles=args.particles,
@@ -670,85 +643,152 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         return y, rot, tran, c
     
-    def training_step(self, batch, batch_idx):
+    def write_debug(self, struct, mask, y, y_recon, global_it):
+        print("Writing debug PNG at iteration %i"%global_it)
+        D = self.lattice.D
+        if B> 8 : 
+            B=8
+        fig, ax = plt.subplots(5, B, layout="constrained", figsize=(30,10))
+        ax = np.array(ax).reshape(5, B) 
+        masked_overlay = np.zeros((D* D, 4))
+        masked_overlay[(mask == 0).detach().cpu().numpy()] = [0, 0, 0, 1]   # Black with full opacity
+        masked_overlay[(mask == 1).detach().cpu().numpy()] = [0, 0, 0, 0]   # Fully transparent
+        masked_overlay = masked_overlay.reshape((D,D,4))
+        for i in range(B):
+            y_ = torch.zeros((D*D), dtype=y.dtype, device=y.device)
+            r_ = torch.zeros((D*D), dtype=y_recon.dtype, device=y_recon.device)
+            if self.domain =="fourier":
+                y_ = y[i, ..., 0] + 1j* y[i, ..., 1]
+                r_[mask] = y_recon[i, ...,0] + 1j* y_recon[i, ...,1]
+                r_ft = torch.zeros((D*D,2), dtype=y_recon.dtype, device=y_recon.device)
+                r_ft[mask] = y_recon[i]
 
+                y_real = fft.ifftn_center(torch.view_as_complex(y[i].reshape(D,D, 2))).real
+                r_real = fft.ifftn_center(torch.view_as_complex(r_ft.reshape(D,D, 2))).real
+            else:
+                y_ = y[i]
+                r_[mask] = y_recon[i]
+                y_real = fft.ihtn_center(y[i].reshape(D,D))
+                r_real = fft.ihtn_center(r_.reshape(D,D))
+            y_ = y_.reshape(D,D)
+            r_ = r_.reshape(D,D)
+            y_real = y_real.reshape(D,D)
+            r_real = r_real.reshape(D,D)
+
+            y_*=gaussian_weight(D,0.1).to(y_.device)
+            r_*=gaussian_weight(D,0.1).to(y_.device)
+
+            y_ = y_.detach().cpu().numpy()
+            r_ = r_.detach().cpu().numpy()
+            y_real = y_real.detach().cpu().numpy()
+            r_real = r_real.detach().cpu().numpy()
+
+            #filter
+            y_ = gaussian_filter(y_, sigma=3)
+            r_ = gaussian_filter(r_, sigma=3)
+            y_real = gaussian_filter(y_real, sigma=3)
+            r_real = gaussian_filter(r_real, sigma=3)
+
+            # Normalize
+            def peak_normalize(img):
+                m = np.max(np.abs(img), axis=(-2,-1), keepdims=True)
+                return img / (m + 1e-8)
+            
+            def l2_normalize(img):
+                norm = np.linalg.norm(img, axis=(-2, -1), keepdims=True)  
+                return img / (norm + 1e-8)
+            
+            y_ =peak_normalize(y_)
+            r_ =peak_normalize(r_)
+            y_real =l2_normalize(y_real)
+            r_real =l2_normalize(r_real)
+
+            vmin= min(y_.min(), r_.min())
+            vmax= min(y_.max(), r_.max())
+            ax[0,i].imshow(y_, vmin=vmin, vmax=vmax, cmap="jet")
+            ax[1,i].imshow(r_, vmin=vmin, vmax=vmax, cmap="jet")
+            ax[2,i].imshow((np.abs(y_-r_)), cmap="jet")
+
+            vmin= min(y_real.min(), r_real.min())
+            vmax= min(y_real.max(), r_real.max())
+            ax[3,i].imshow(y_real, vmin=vmin, vmax=vmax, cmap="Greys_r")
+            ax[4,i].imshow(r_real, vmin=vmin, vmax=vmax, cmap="Greys_r")
+
+            ax[0,i].imshow(masked_overlay)
+            ax[1,i].imshow(masked_overlay)
+            ax[2,i].imshow(masked_overlay)
+            ax[0,i].axis('off')
+            ax[1,i].axis('off')
+            ax[2,i].axis('off')
+            ax[3,i].axis('off')
+            ax[4,i].axis('off')
+        plt.subplots_adjust(wspace=0, hspace=0)
+        fig.savefig(self.args.outdir + "/debug_%s.png"%str(global_it).zfill(5))
+        plt.close(fig)
+        output_single_pdb(
+            all_atom_positions= (struct["final_atom_positions"] @ self.model.decoder.rot_init + self.model.decoder.trans_init[..., None, :]).detach().cpu().numpy()[-1],
+            all_atom_mask=struct["all_atom_mask"].detach().cpu().numpy()[-1],
+            aatype=struct["aatype"].detach().cpu().numpy()[-1],
+            residue_index=struct["residue_index"].detach().cpu().numpy()[-1],
+            chain_index=struct["asym_id"].detach().cpu().numpy()[-1],
+            file= self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5)
+        )
+    def run_encoder(self, y, c=None):
+        if self.domain == "fourier":
+            y = (y[...,0] - y[...,1]) 
+        input_ = (y,)
+        if c is not None:
+            input_ = (x * c.sign() for x in input_)  # phase flip by the ctf
+
+        z_mu, z_logvar = self.model.encode(*input_)
+
+        return z_mu, z_logvar 
+
+    def run_decoder(self, z, rot, c):
+        B = z.size(0)
+        # decode
+        mask = self.lattice.get_circular_mask(self.lattice.D // 2)  # restrict to circular mask
+
+        if isinstance(self.model.decoder, AFDecoderReal):
+            y_recon, struct, y_recon_real = self.model(rot, z)
+            y_recon =  y_recon.view(B, -1)[..., mask]
+        elif isinstance(self.model.decoder, AFDecoder):
+            y_recon, struct = self.model(self.lattice.coords[mask] / self.lattice.extent / 2 @ rot, z)
+        else:
+            y_recon = self.model(self.lattice.coords[mask] / self.lattice.extent / 2 @ rot, z)
+
+        y_recon = y_recon.view(B, -1)
+        y_recon *= c.view(B, -1)[:, mask]
+
+        if self.domain =="fourier":
+            y_recon = torch.view_as_real(y_recon).to(torch.float32)
+
+        return y_recon, mask, struct,# y_tmp, y_recon_real
+
+
+    def training_step(self, batch, batch_idx):
+        
+        # Preprocessing
         y, rot, _, c = self.prepare_batch(batch)
 
         B = batch[-1].size(0)
         global_it = self.Nparticles * self.current_epoch +  batch_idx * B
         beta = self.beta_schedule( global_it)
 
+        # Encdoer
+        z_mu, z_logvar = self.run_encoder(y, c)
 
+        # Reparametrize latent space
+        z = self.model.reparameterize(z_mu, z_logvar)
 
-        z_mu, z_logvar = run_encoder(
-            self.model,
-            (y[...,0] - y[...,1]) if self.domain == "fourier" else y,
-            c
-        )
+        # Decoder
+        y_recon, mask, struct = self.run_decoder(z,rot, c)
 
-        z, y_recon, mask, struct =  run_decoder(
-            self.model,
-            self.lattice,
-            z_mu, 
-            z_logvar,
-            rot, 
-            None,
-            c
-        )
-
-        if self.domain =="fourier":
-            y_recon = torch.view_as_real(y_recon).to(torch.float32)
-
-
+        # Write debug
         if self.args.debug and self.trainer.is_global_zero and ((global_it)%100 == 0  or batch_idx ==0):
-            print("Writing debug PNG at iteration %i"%global_it)
-            D = self.lattice.D
-            if B> 8 : 
-                B=8
-            fig, ax = plt.subplots(3, B, layout="constrained", figsize=(30,10))
-            ax = np.array(ax).reshape(3, B) 
+            self.write_debug(struct, mask, y, y_recon, global_it)
 
-            masked_overlay = np.zeros((D* D, 4))
-            masked_overlay[(mask == 0).detach().cpu().numpy()] = [0, 0, 0, 1]   # Black with full opacity
-            masked_overlay[(mask == 1).detach().cpu().numpy()] = [0, 0, 0, 0]   # Fully transparent
-            masked_overlay = masked_overlay.reshape((D,D,4))
-            for i in range(B):
-                y_ = torch.zeros((D*D), dtype=y.dtype, device=y.device)
-                r_ = torch.zeros((D*D), dtype=y_recon.dtype, device=y_recon.device)
-                if self.domain =="fourier":
-                    y_ = y[i, ..., 0] - y[i, ..., 1]
-                    r_[mask] = y_recon[i, ...,0] - y_recon[i, ...,1]
-                else:
-                    y_ = y[i]
-                    r_[mask] = y_recon[i]
-                y_ = y_.reshape(D,D).detach().cpu().numpy()
-                r_ = r_.reshape(D,D).detach().cpu().numpy()
-                y_ /= (np.sum(np.square(y_), axis=(-1,-2)) )**0.5
-                r_ /= (np.sum(np.square(r_), axis=(-1,-2)) )**0.5
-                kwargs = {
-                    "vmin" : min(y_.min(), r_.min()),
-                    "vmax" : max(y_.max(), r_.max()),
-                    "cmap" : "jet"
-                }
-                ax[0,i].imshow(y_, **kwargs)
-                ax[1,i].imshow(r_, **kwargs)
-                ax[2,i].imshow((np.abs(y_-r_)), **kwargs)
-
-                ax[0,i].imshow(masked_overlay)
-                ax[1,i].imshow(masked_overlay)
-                ax[2,i].imshow(masked_overlay)
-                ax[0,i].axis('off')
-                ax[1,i].axis('off')
-                ax[2,i].axis('off')
-            plt.subplots_adjust(wspace=0, hspace=0)
-            fig.savefig(self.args.outdir + "/fig_%s.png"%str(global_it).zfill(5))
-            plt.close(fig)
-
-            fig.savefig(self.args.outdir + "/debug_%s.png"%str(global_it).zfill(5))
-
-            struct_to_pdb(tensor_tree_map(lambda x: x.detach().cpu().numpy()[-1], struct),
-                           self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5))
-
+        # Computing loss
         loss, gen_loss, kld = self.loss_function(
             z_mu,
             z_logvar,
@@ -762,34 +802,15 @@ class LitHetOnlyVAE(pl.LightningModule):
         # Logging
         self.log("loss", loss, prog_bar=True, sync_dist=True, on_epoch=True, on_step=True)
         self.log("kld", kld, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True)
-
         for k,v in gen_loss.items():
             self.log(k, v, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True)
-
-        # prefix = "%s/%i" %(self.args.outdir, global_it)
-        # write_mrc(filename = prefix+"_y.mrcs", array = y.detach().cpu().numpy(), is_vol=False)
-        # write_mrc(filename = prefix+"_y_recon.mrcs", array = y_tmp.detach().cpu().numpy(), is_vol=False)
-        
-        # write_mrc(filename = prefix+"_y_r.mrcs", array = batch[1].detach().cpu().numpy(), is_vol=False)
-        # write_mrc(filename = prefix+"_y_r_recon.mrcs", array = y_recon_real.detach().cpu().numpy(), is_vol=False)
-
-
-        # import matplotlib.pyplot as plt
-        # fig, ax = plt.subplots(1,1)
-        # write_mrc(filename = prefix+"_y_r_diff.mrcs", array = batch[1].detach().cpu().numpy() - y_recon_real.detach().cpu().numpy(), is_vol=False)
 
         return loss
 
 
     def validation_step(self, batch, batch_idx):
-        y, rot, tran, c = self.prepare_batch(batch)
-
-        z_mu, z_logvar = run_encoder(
-            self.model,
-            (y[...,0] - y[...,1]) if self.domain == "fourier" else y,
-            c
-        )
-
+        y, _, _, c = self.prepare_batch(batch)
+        z_mu, z_logvar = self.run_encoder(y, c)
         self.val_z_mu.append(z_mu)
         self.val_z_logvar.append(z_logvar)
     
@@ -807,6 +828,26 @@ class LitHetOnlyVAE(pl.LightningModule):
             self.val_z_mu.clear()
             self.val_z_logvar.clear() 
 
+    # def on_validation_epoch_end(self):
+
+    #     z_mu_local = torch.cat(self.val_z_mu, dim=0).detach().cpu().numpy()
+    #     z_logvar_local = torch.cat(self.val_z_logvar, dim=0).detach().cpu().numpy()
+
+    #     world_size = torch.distributed.get_world_size()
+    #     gathered_mu, gathered_logvar = [None]*world_size, [None]*world_size
+
+    #     torch.distributed.all_gather_object(gathered_mu, z_mu_local)
+    #     torch.distributed.all_gather_object(gathered_logvar, z_logvar_local)
+
+    #     if torch.distributed.get_rank() == 0:
+    #         z_mu_all = np.concatenate(gathered_mu, axis=0)
+    #         z_logvar_all = np.concatenate(gathered_logvar, axis=0)
+    #         out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
+    #         out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
+            
+    #         save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu_all, z_logvar_all, out_weights, out_z)
+    
+
     def loss_function(
             self,
             z_mu,
@@ -814,20 +855,40 @@ class LitHetOnlyVAE(pl.LightningModule):
             y,
             y_recon,
             mask,
-            beta: float,
-            struct=None,
+            beta,
+            struct,
         ):
 
         # Reconstruction loss
         D =  y.shape[-2]
         B = y.size(0)
-        if self.domain=="fourier":
-            y = y.view(B, D*D, 2)[:, mask]
-            data_loss =torch.mean( 1- fourier_corr(torch.view_as_complex(y), torch.view_as_complex(y_recon)))
+
+        if self.domain =="fourier":
+            r_ = torch.zeros((B, D*D, 2), dtype=y_recon.dtype, device=y_recon.device)
+            y = y.view(B, D*D, 2)
+            r_[:, mask] = y_recon[:]
+            y_real = ifft2_center(torch.view_as_complex(y.reshape(B, D,D, 2))).real
+            r_real = ifft2_center(torch.view_as_complex(r_.reshape(B, D,D, 2))).real
         else:
-            y = y.view(B, -1)[:, mask]
-            cc = get_cc(y_recon, y)
-            data_loss = torch.mean(1-cc)
+            r_ = torch.zeros((B, D*D), dtype=y_recon.dtype, device=y_recon.device)
+            y = y.view(B, D*D)
+            r_[:, mask] = y_recon[:]
+            y_real = fft.iht2_center(y.reshape(B,D,D))
+            r_real = fft.iht2_center(r_.reshape(B,D,D))
+
+        cc = get_cc(y_real, r_real)
+        data_loss = torch.mean(1-cc)
+
+        # if self.domain=="fourier":
+        #     y = y.view(B, D*D, 2)[:, mask]
+        #     cc = fourier_corr(torch.view_as_complex(y), torch.view_as_complex(y_recon))
+        #     cc = torch.mean(cc)
+
+
+        # else:
+        #     y = y.view(B, -1)[:, mask]
+        #     cc = get_cc(y_recon, y)
+        #     cc = torch.mean(cc)
 
         # Struct violations loss
         struct_violations = find_structural_violations(
@@ -848,10 +909,10 @@ class LitHetOnlyVAE(pl.LightningModule):
                 )
                 
         # Center Loss
-        crd = struct_to_crd(struct, ca=not self.model.decoder.all_atom)
-        crd = crd @ self.model.decoder.rot_init + self.model.decoder.trans_init[..., None, :]
-        center_loss = torch.mean(torch.sum((torch.mean(crd, dim=-2) ** 2 ), dim=-1))
-        center_loss = center_loss
+        # crd = struct_to_crd(struct, ca=not self.model.decoder.all_atom)
+        # crd = crd @ self.model.decoder.rot_init + self.model.decoder.trans_init[..., None, :]
+        # center_loss = torch.mean(torch.sum((torch.mean(crd, dim=-2) ** 2 ), dim=-1))
+        center_loss = 0.0
 
         # TOTAL GEN LOSS
         gen_loss = {
@@ -984,9 +1045,26 @@ def main(args: argparse.Namespace) -> None:
     if args.load:
         logger.info("Loading checkpoint from {}".format(args.load))
         checkpoint = torch.load(args.load)
-        model.model.load_state_dict(checkpoint["model_state_dict"])
-        optim = model.configure_optimizers()
-        optim.load_state_dict(checkpoint["optimizer_state_dict"])
+        # filter unwanted keys
+        exclude_prefixes = [
+            "lattice",
+            "decoder.embeddings",
+        ]
+        exclude_exact = {"decoder.rot_init", "decoder.trans_init"}
+
+        filtered_state_dict = {
+            k: v for k, v in checkpoint["model_state_dict"].items()
+            if not any(k.startswith(p) for p in exclude_prefixes)
+            and k not in exclude_exact
+        }
+
+        # now load
+        missing, unexpected = model.model.load_state_dict(filtered_state_dict, strict=False)
+        print("Missing keys:", missing)
+        print("Unexpected keys:", unexpected)
+
+        # optim = model.configure_optimizers()
+        # optim.load_state_dict(checkpoint["optimizer_state_dict"])
         logger.info("Successfully restored states from {}".format(args.load))
 
     # save configuration
@@ -1002,21 +1080,29 @@ def main(args: argparse.Namespace) -> None:
     #     save_last=False,                  # also save 'last.ckpt'
     #     verbose=True,
     # )
+
+    cluster_environment = MPIEnvironment() if args.mpi_plugin else None
+
+    strategy = DDPStrategy(find_unused_parameters=False,
+                            cluster_environment=cluster_environment,
+                            process_group_backend="nccl")
+                            # process_group_backend="gloo")
+
+
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
         accelerator="auto",
-        strategy=DDPStrategy(process_group_backend="gloo"),
-        # strategy=DDPStrategy(),
-        devices=args.device,                 # or >1 for multi-GPU
-        precision=args.precision,  # AMP support
+        strategy=strategy,
+        devices=args.devices, 
+        precision=args.precision,
         log_every_n_steps=10,
-        callbacks=None,           # optional callbacks like ModelCheckpoint
-        logger=CSVLogger(args.outdir, name="", version="")
+        callbacks=None,
+        num_nodes = args.num_nodes ,
+        logger=CSVLogger(args.outdir, name="", version=""),
+        max_steps=10
     )
 
     trainer.fit(model, datamodule=datamodule)
-
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

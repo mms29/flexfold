@@ -9,6 +9,8 @@ import tqdm
 
 from openfold.np import residue_constants, protein
 from openfold.utils.tensor_utils import tensor_tree_map
+from cryodrgn.fft import fftshift
+from torch.fft import ifft2
 
 def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file, chain_index=None, residue_index=None):
 
@@ -58,32 +60,58 @@ def struct_to_pdb(struct, file):
         fp.write(outstring)
 
 
+def ifft2_center(img: torch.Tensor) -> torch.Tensor:
+    """2-dimensional discrete inverse Fourier transform reordered with origin at center."""
+    if img.dtype == torch.float16:
+        img = img.type(torch.float32)
 
-def fourier_corr(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-    # normalized complex correlation in Fourier domain 
+    return fftshift(ifft2(fftshift(img, dim=(-1, -2))), dim=(-1, -2))
+
+
+
+def weighted_normalized_l2(F_pred, F_target, weights, eps=1e-8):
+    if F_pred.shape[-1] == 2:
+        F_pred = torch.view_as_complex(F_pred)
+        F_target = torch.view_as_complex(F_target)
+
+    diff = F_pred - F_target
+    weighted_sq_diff = weights * torch.abs(diff)**2
+    numerator = torch.sum(weighted_sq_diff, dim=-1)
+
+    weighted_ref_norm2 = torch.sum(weights * torch.abs(F_target)**2, dim=-1)
+    loss = torch.sqrt(numerator / (weighted_ref_norm2 + eps))
+
+    return loss.mean()
+
+def gaussian_weight(size, sigma=0.5):
+    y = torch.arange(size).float() - size//2
+    x = torch.arange(size).float() - size//2
+    Y, X = torch.meshgrid(y, x, indexing='ij')
+    R = torch.sqrt(X**2 + Y**2)
+    R /= R.max()
+    weights = torch.exp(-0.5 * (R/sigma)**2)
+    return weights
+
+def frequency_weights(size, p=1.0):
+    y = torch.arange(size).float() - size//2
+    x = torch.arange(size).float() - size//2
+    Y, X = torch.meshgrid(y, x, indexing='ij')
+    R = torch.sqrt(X**2 + Y**2)  # radial distance
+    R /= R.max()                  # normalize 0..1
+    weights = (1 - R)**p          # 1 at center, 0 at edges
+    return weights
+
+def fourier_corr(A: torch.Tensor, B: torch.Tensor,  eps:float=1e-8) -> torch.Tensor:
     num = torch.sum(A * torch.conj(B), dim=(-1,-2))
     denom = torch.sqrt(torch.sum(torch.abs(A) ** 2, dim=(-1,-2)) * torch.sum(torch.abs(B) ** 2, dim=(-1,-2)))
+    return (num / (denom+ eps)).real
 
-    return (num / denom).real  # Return real part only
 
+def get_cc(A: torch.Tensor, B: torch.Tensor, eps:float=1e-8) -> torch.Tensor:
+    num = torch.sum(A * B, dim=(-1,-2))
+    denom = torch.sqrt(torch.sum(A**2, dim=(-1,-2)) * torch.sum(B**2, dim=(-1,-2)))
+    return num / (denom + eps)
 
-def get_cc(im1, im2):
-    """
-    im1 : [B, N, N]
-    im2 : [B, N, N]
-    output : [B]
-    """
-    
-    return torch.sum( im1 * im2, dim=(-1,-2)) / (
-        torch.sqrt(
-            torch.sum(
-                torch.square(im1), dim=(-1,-2)
-            ) *
-            torch.sum(
-                torch.square(im2), dim=(-1,-2)
-            )
-        )
-    )
 
 def euler2matrix(angles):
     return Rotation.from_euler("zyz", np.array(angles), degrees=True).as_matrix()

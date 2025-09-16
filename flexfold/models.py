@@ -60,7 +60,6 @@ def unparallelize(model: nn.Module) -> nn.Module:
         return model.module
     return model
 
-
 class HetOnlyVAE(nn.Module):
     # No pose inference
     def __init__(
@@ -1303,6 +1302,13 @@ def get_afdecoder(
 
     initial_pose = torch.load(initial_pose_path)
 
+    print("\nSuccessfully loaded %s"%initial_pose_path)
+    print("Rotation : ")
+    print(initial_pose["R"])
+    print("Translation : ")
+    print(initial_pose["T"])
+    print()
+
 
     config_preset = get_model_basename(af_checkpoint_path)
     if config_preset.startswith("params_") :
@@ -1490,7 +1496,7 @@ class AFDecoder(torch.nn.Module):
         print("\t pair_stack : %s"%str(pair_stack))
         print("\t integration diameter set to %i"%((self.n_pix_cutoff)))
         print("--\n")
-
+        
     def forward(self, crd_lattice, z):
 
         struct = self.structure_decoder(z)
@@ -1498,7 +1504,6 @@ class AFDecoder(torch.nn.Module):
         # Apply initial transform
         crd = struct_to_crd(struct, ca=not self.all_atom)
         crd = crd @ self.rot_init + self.trans_init[..., None, :]
-
 
         if self.domain == "hartley":
 
@@ -1527,7 +1532,6 @@ class AFDecoder(torch.nn.Module):
 
         # [*, N**2, Zdim]
         pair_update = z.unsqueeze(-2).repeat(1, self.res_size **2, 1) 
-
         if self.pair_stack : 
             pos_mask = embedding_expand["seq_mask"]
             pair_mask = pos_mask[..., None] * pos_mask[..., None, :]
@@ -1555,6 +1559,7 @@ class AFDecoder(torch.nn.Module):
         else:
             pair_update = self.decoder_(pair_update)
 
+
             # [*, N, N, Pdim]
             pair_update = pair_update.reshape(batch_dim + (self.res_size, self.res_size, self.outdim))
             
@@ -1574,6 +1579,7 @@ class AFDecoder(torch.nn.Module):
             inplace_safe=inplace_safe,
             _offload_inference=self.globals.offload_inference,
         )
+
         outputs["final_atom_positions"] = atom14_to_atom37(
             outputs["sm"]["positions"][-1], embedding_expand
         )

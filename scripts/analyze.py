@@ -26,6 +26,7 @@ import cryodrgn
 from cryodrgn import utils, config
 from cryodrgn.commands import backproject_voxel
 from flexfold import analysis
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -504,6 +505,35 @@ class VolumeGenerator:
         analysis.gen_volumes(self.weights, self.config, zfile, outdir, **self.vol_args)
 
 
+def loss_plot(infile, oufile, w = 10):
+    
+    movavg = lambda arr: np.convolve(
+        np.nan_to_num(arr), np.ones(w), 'valid'
+    ) / np.convolve(~np.isnan(arr), np.ones(w), 'valid')
+
+    losses=["data_loss_step", "chi_loss_step", "viol_loss_step","center_loss_step", "kld_step", "loss_step"]
+    col = "tab:blue"
+    nrows = 2
+    ncols=3
+    fig, ax = plt.subplots(nrows,ncols, figsize=(10,5), layout="constrained")
+    for x in range(nrows):
+        for y in range(ncols):
+            ii = x *ncols + y
+            if ii>=len(losses):
+                break
+
+            metrics =pd.read_csv(infile)
+            ax[x,y].plot(metrics["step"], metrics[losses[ii]], alpha=0.5, c=col)
+            ax[x,y].plot(metrics["step"][:-(w-1)]*(len(metrics["step"])/(len(metrics["step"])-w)), movavg(metrics[losses[ii]]), label = "run", c=col)
+            ax[x,y].set_xlabel("step")
+            ax[x,y].set_ylabel(losses[ii])
+    ax[-1,-1].legend()
+    fig.savefig(oufile, dpi=300)
+
+    plt.close(fig)
+
+
+
 def main(args: argparse.Namespace) -> None:
     matplotlib.use("Agg")  # non-interactive backend
     t1 = dt.now()
@@ -568,6 +598,9 @@ def main(args: argparse.Namespace) -> None:
     logger.info(f"Saving results to {outdir}")
     if not os.path.exists(outdir):
         os.mkdir(outdir)
+
+
+    loss_plot(f"{workdir}/metrics.csv", f"{outdir}/losses.png")
 
     z = utils.load_pkl(zfile)
     zdim = z.shape[1]
@@ -651,7 +684,6 @@ def main(args: argparse.Namespace) -> None:
     logger.info(f"Finished in {dt.now() - t1}")
 
 if __name__ == "__main__":
-    print("hellooo")
     parser = argparse.ArgumentParser()
     parser= add_args(parser)
 

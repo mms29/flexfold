@@ -283,7 +283,7 @@ def main(args):
             '`openfold_checkpoint_path` was specified, but no OpenFold checkpoints are available for multimer mode')
 
     ###################################################
-    config.data.common.max_recycling_iters = 50
+    config.data.common.max_recycling_iters = 20
 
     model_generator = load_models_from_command_line(
         config,
@@ -325,9 +325,9 @@ def main(args):
                 feature_dict, mode='predict', is_multimer=is_multimer
             )
 
-            target_feats = get_target_feats("../cryofold/cryobench_IgD/1HZH.cif", data_processor)
-            model.__class__ = AlphaFoldTargeted
-            model.target_pos = torch.as_tensor(target_feats["all_atom_positions"], device=args.model_device)
+            # target_feats = get_target_feats("../cryofold/cryobench_IgD/1HZH.cif", data_processor)
+            # model.__class__ = AlphaFoldTargeted
+            # model.target_pos = torch.as_tensor(target_feats["all_atom_positions"], device=args.model_device)
 
             processed_feature_dict = {
                 k: torch.as_tensor(v, device=args.model_device)
