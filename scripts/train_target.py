@@ -30,7 +30,6 @@ import torch
 import torch.nn as nn
 from torch.nn.parallel import DataParallel
 import torch.nn.functional as F
-from pytorch_lightning.plugins.environments import MPIEnvironment
 
 try:
     import apex.amp as amp  # type: ignore  # PYR01
@@ -57,31 +56,14 @@ from flexfold import dataset
 
 from flexfold.models import HetOnlyVAE, AFDecoderReal, AFDecoder, struct_to_crd
 from flexfold.pose import PoseTracker
-from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb,weighted_normalized_l2, gaussian_weight, frequency_weights
+from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb
 from pytorch_lightning.strategies import DDPStrategy
-from scipy.ndimage import gaussian_filter
-from flexfold.core import ifft2_center
 
-def print_model_summary(model):
-    total_params = 0
-    trainable_params = 0
-    frozen_params = 0
 
-    for name, p in model.named_parameters():
-        n = p.numel()
-        total_params += n
-        if p.requires_grad:
-            trainable_params += n
-        else:
-            frozen_params += n
+from openfold.utils.loss import fape_loss, compute_renamed_ground_truth
+from torch.utils.data import Dataset, DataLoader
 
-    print(f"{'='*50}")
-    print(f"Model Summary")
-    print(f"{'='*50}")
-    print(f"Total parameters   : {total_params:,}")
-    print(f"Trainable params   : {trainable_params:,}")
-    print(f"Frozen params      : {frozen_params:,}")
-    print(f"{'='*50}")
+
 
 logger = logging.getLogger(__name__)
 
@@ -117,12 +99,11 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--sigma", type=float, default=2.5, help="TODO"
     )
     parser.add_argument(
-        "--real_space", action="store_true", help="TODO"
-    )        
+        "--af_decoder", action="store_true", help="TODO"
+    )
     parser.add_argument(
-        "--mpi_plugin", action="store_true", help="TODO"
+        "--real_space", action="store_true", help="TODO"
     )    
-    
     parser.add_argument(
         "--quality_ratio", type=float, default=5.0, help="TODO"
     )
@@ -151,16 +132,13 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--debug", action="store_true", help="TODO"
     )
     parser.add_argument(
-        "--devices", type=str, default="auto", help="TODO"
-    )
-    parser.add_argument(
-        "--num_nodes", type=int, default=1, help="TODO"
+        "--device", type=str, default="auto", help="TODO"
     )
     parser.add_argument(
         "--pair_stack", action="store_true", help="TODO"
     )
     parser.add_argument(
-        "--frozen_structure_module", action="store_true", help="TODO"
+        "--target_file", type=str, default="auto", help="TODO"
     )
     parser.add_argument(
         "--poses", type=os.path.abspath, required=True, help="Image poses (.pkl)"
@@ -447,7 +425,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     group.add_argument(
         "--domain",
-        choices=("hartley", "fourier", "real"),
+        choices=("hartley", "fourier"),
         default="fourier",
         help="Volume decoder representation (default: %(default)s)",
     )
@@ -461,23 +439,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
 
     return parser
 
-def save_config(args, dataset, lattice, out_config):
-    dataset_args = dict(
-        particles=args.particles,
-        norm=dataset.norm,
-        invert_data=args.invert_data,
-        ind=args.ind,
-        window=args.window,
-        window_r=args.window_r,
-        datadir=args.datadir,
-        ctf=args.ctf,
-        poses=args.poses,
-        do_pose_sgd=args.do_pose_sgd,
-    )
-    if args.encode_mode == "tilt":
-        dataset_args["ntilts"] = args.ntilts
 
-    lattice_args = dict(D=lattice.D, extent=lattice.extent, ignore_DC=lattice.ignore_DC)
+
+def save_config(args, out_config):
     model_args = dict(
         qlayers=args.qlayers,
         qdim=args.qdim,
@@ -487,9 +451,18 @@ def save_config(args, dataset, lattice, out_config):
         encode_mode=args.encode_mode,
         enc_mask=args.enc_mask,
         pe_type=args.pe_type,
+        feat_sigma=args.feat_sigma,
         pe_dim=args.pe_dim,
         domain=args.domain,
         activation=args.activation,
+        tilt_params=dict(
+            tdim=args.tdim,
+            tlayers=args.tlayers,
+            t_emb_dim=args.t_emb_dim,
+            ntilts=args.ntilts,
+        ),
+
+        af_decoder = args.af_decoder,
         initial_pose_path = args.initial_pose_path,
         embedding_path=args.embedding_path,
         af_checkpoint_path =args.af_checkpoint_path,
@@ -498,15 +471,15 @@ def save_config(args, dataset, lattice, out_config):
         quality_ratio = args.quality_ratio,
         all_atom = args.all_atom,
         pair_stack = args.pair_stack,
+        target_file= args.target_file,
         real_space = args.real_space,
         is_multimer = args.multimer,
     )
     config = dict(
-        dataset_args=dataset_args, lattice_args=lattice_args, model_args=model_args
+        model_args=model_args
     )
     config["seed"] = args.seed
     cryodrgn.config.save(config, out_config)
-
 
 
 class LitHetOnlyVAE(pl.LightningModule):
@@ -515,6 +488,10 @@ class LitHetOnlyVAE(pl.LightningModule):
         self.D = D
         self.Nparticles = Nparticles
         super().__init__()
+
+        if args.encode_mode == "conv":
+            assert self.D - 1 == 64, "Image size must be 64x64 for convolutional encoder"
+
 
         self.domain = self.args.domain
 
@@ -528,7 +505,7 @@ class LitHetOnlyVAE(pl.LightningModule):
             in_dim = int(enc_mask.sum())
         elif args.enc_mask == -1:
             enc_mask = None
-            in_dim = self.lattice.D**2 if not (args.domain =="real") else (self.lattice.D - 1) ** 2
+            in_dim = self.lattice.D**2 if not args.use_real else (self.lattice.D - 1) ** 2
         else:
             raise RuntimeError(
                 "Invalid argument for encoder mask radius {}".format(args.enc_mask)
@@ -547,6 +524,10 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         # load ctf ------------------------------------------------------------------------------------------------------------------------
         if args.ctf is not None:
+            if args.use_real:
+                raise NotImplementedError(
+                    "Not implemented with real-space encoder. Use phase-flipped images instead"
+                )
             logger.info("Loading ctf params from {}".format(args.ctf))
             ctf_params = ctf.load_ctf_for_training(D - 1, args.ctf)
             if args.ind is not None:
@@ -568,9 +549,6 @@ class LitHetOnlyVAE(pl.LightningModule):
         self.beta_schedule = get_beta_schedule(args.beta)
 
         # load model ------------------------------------------------------------------------------------------------------------------------
-
-        print("HHHHHHHHHELLOOOOO")
-
         self.model = HetOnlyVAE(
             self.lattice,
             args.qlayers,
@@ -580,11 +558,14 @@ class LitHetOnlyVAE(pl.LightningModule):
             in_dim,
             args.zdim,
             encode_mode=args.encode_mode,
-            enc_mask=None if self.domain == "real" else enc_mask,
+            enc_mask=enc_mask,
             enc_type=args.pe_type,
             enc_dim=args.pe_dim,
             domain=args.domain,
             activation=activation,
+            feat_sigma=args.feat_sigma,
+            tilt_params={},
+            af_decoder=args.af_decoder,
             initial_pose_path=args.initial_pose_path,
             embedding_path=args.embedding_path,
             sigma=args.sigma,
@@ -592,6 +573,7 @@ class LitHetOnlyVAE(pl.LightningModule):
             quality_ratio=args.quality_ratio,
             all_atom=args.all_atom,
             pair_stack=args.pair_stack,
+            target_file=args.target_file,
             real_space=args.real_space,
             is_multimer = args.multimer,
             af_checkpoint_path =args.af_checkpoint_path,
@@ -600,322 +582,44 @@ class LitHetOnlyVAE(pl.LightningModule):
         self.val_z_mu = []
         self.val_z_logvar = []
 
-        if self.args.frozen_structure_module:
-            for param in self.model.decoder.structure_module.parameters():
-                param.requires_grad = False
-
-        if self.domain == "real":
-            self.model.enc_mask = None
-
-
-        print_model_summary(self.model)
-
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.args.lr,  weight_decay=self.args.wd
         )
-        if self.args.do_pose_sgd : 
-            pose_optimizer = torch.optim.SparseAdam(list(self.posetracker.parameters()), lr=self.args.pose_lr)
-            return [optimizer, pose_optimizer]
+        return optimizer
         
-        else:
-            return optimizer
-        
-    def prepare_batch(self, batch):
-        ind = batch[-1]
-        B = ind.size(0)
-        D = self.lattice.D
 
-        # Pose
-        rot, tran = self.posetracker.get_pose(ind)
-
-        # Image
-        y_real = self.lattice.translate_real(batch[1], tran.unsqueeze(1)).view(B, D-1, D-1)
-        y_real = y_real.transpose(-1,-2)
-
-        if self.domain == "fourier":
-            y = torch.view_as_real(batch[2])
-            y = self.lattice.translate_ft(y.view(B, D*D, 2), tran.unsqueeze(1)).view(B, D, D, 2)
-            # y_real = ifft2_center(torch.view_as_complex(y)).real
-        elif self.domain == "hartley":
-            y = batch[0]
-            y = self.lattice.translate_ht(y.view(B, -1), tran.unsqueeze(1)).view(B, D, D)
-            # y_real = fft.iht2_center(y)
-        elif self.domain == "real":
-            y=y_real.contiguous()
-        
-        # CTF
-        if self.ctf_params is not None:
-            ctf_param = self.ctf_params[ind]
-            freqs = self.lattice.freqs2d.unsqueeze(0).expand(
-                B, *self.lattice.freqs2d.shape
-            ) / ctf_param[:, 0].view(B, 1, 1)
-            c = ctf.compute_ctf(freqs, *torch.split(ctf_param[:, 1:], 1, 1)).view(
-                B, D, D
-            )
-        else: 
-            c =None
-
-        return y, y_real, rot, tran, c
     
-    def write_debug(self, struct, mask, y, y_real, y_recon, y_recon_real, global_it):
-        """
-        y : ?
-        y_real :[B, D-1, D-1] Real
-
-        y_recon : [B, D, D] FT complex
-        y_recon_real :[B, D-1, D-1] Real
-        """
-        print("Writing debug PNG at iteration %i"%global_it)
-        D = self.lattice.D
-        B=y_real.size(0)
-        if B> 8 : 
-            B=8
-        fig, ax = plt.subplots(3, B, layout="constrained", figsize=(5*B,10))
-        ax = np.array(ax).reshape(3, B) 
-        masked_overlay = np.zeros((D* D, 4))
-        masked_overlay[(mask == 0).detach().cpu().numpy()] = [0, 0, 0, 1]   # Black with full opacity
-        masked_overlay[(mask == 1).detach().cpu().numpy()] = [0, 0, 0, 0]   # Fully transparent
-        masked_overlay = masked_overlay.reshape((D,D,4))
-
-        for i in range(B):
-            #filter
-            y_ = y_real[i].detach().cpu().numpy()
-            r_ = y_recon_real[i].detach().cpu().numpy()
-
-            sigma = 1.5
-            y_ = gaussian_filter(y_, sigma=sigma)
-            r_ = gaussian_filter(r_, sigma=sigma)
-            # Normalize
-            def peak_normalize(img):
-                m = np.max(np.abs(img), axis=(-2,-1), keepdims=True)
-                return img / (m + 1e-8)
-            
-            def l2_normalize(img):
-                norm = np.linalg.norm(img, axis=(-2, -1), keepdims=True)  
-                return img / (norm + 1e-8)
-
-            y_ =l2_normalize(y_)
-            r_ =l2_normalize(r_)
-
-            vmin= min(y_.min(), r_.min())
-            vmax= min(y_.max(), r_.max())
-            ax[0,i].imshow(y_, vmin=vmin, vmax=vmax, cmap="Greys")
-            ax[1,i].imshow(r_, vmin=vmin, vmax=vmax, cmap="Greys")
-            ax[2,i].imshow(np.abs(r_-y_), vmin=0.0, vmax=max(np.abs([vmax,vmin])), cmap="jet")
-
-            # ax[0,i].imshow(masked_overlay)
-            # ax[1,i].imshow(masked_overlay)
-            # ax[2,i].imshow(masked_overlay)
-            ax[0,i].axis('off')
-            ax[1,i].axis('off')
-            ax[2,i].axis('off')
-        plt.subplots_adjust(wspace=0, hspace=0)
-        fig.savefig(self.args.outdir + "/debug_%s.png"%str(global_it).zfill(5))
-        plt.close(fig)
-        output_single_pdb(
-            all_atom_positions= (struct["final_atom_positions"] @ self.model.decoder.rot_init + self.model.decoder.trans_init[..., None, :]).detach().cpu().numpy()[-1],
-            all_atom_mask=struct["all_atom_mask"].detach().cpu().numpy()[-1],
-            aatype=struct["aatype"].detach().cpu().numpy()[-1],
-            residue_index=struct["residue_index"].detach().cpu().numpy()[-1],
-            chain_index=struct["asym_id"].detach().cpu().numpy()[-1] if "asym_id" in struct else None,
-            file= self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5)
-        )
-    def run_encoder(self, y, c=None):
-        if self.domain == "fourier":
-            y = (y[...,0] - y[...,1]) 
-        input_ = (y,)
-        if self.domain != "real":
-            if c is not None:
-                input_ = (x * c.sign() for x in input_)  # phase flip by the ctf
-
-        z_mu, z_logvar = self.model.encode(*input_)
-
-        return z_mu, z_logvar 
-
-    def run_decoder(self, z, rot, c):
-        B = z.size(0)
-        D = self.lattice.D
-        mask = self.lattice.get_circular_mask(self.lattice.D // 2)  # restrict to circular mask
-
-        # decode
-        if isinstance(self.model.decoder, AFDecoderReal):
-            y_recon, struct = self.model(rot, z)
-            y_recon =  y_recon.view(B, -1)[..., mask]
-        elif isinstance(self.model.decoder, AFDecoder):
-            y_recon, struct = self.model(self.lattice.coords[mask] / self.lattice.extent / 2 @ rot, z)
-        else:
-            raise RuntimeError("Unknown decoder type:%s"%( type(self.model.decoder).__name__))
-
-        # Apply CTF
-        y_recon = y_recon.view(B, -1)
-        y_recon *= c.view(B, -1)[:, mask]
-
-        # Pad mask with 0
-        tmp = y_recon
-        y_recon = torch.zeros((B, D*D), dtype=y_recon.dtype, device=y_recon.device)
-        y_recon[:, mask] = tmp[:]
-
-        # Real space
-        y_recon_real = y_recon.reshape(B, D,D)
-        y_recon_real = fft.unsymmetrize_ht(y_recon_real)
-        y_recon_real = ifft2_center(y_recon_real).real
-
-        return y_recon, y_recon_real, mask, struct
-
-
-    def training_step(self, batch, batch_idx):
-
-       
-        # Preprocessing
-        y, y_real, rot, _, c = self.prepare_batch(batch)
-
-        B = batch[-1].size(0)
-        global_it = self.Nparticles * self.current_epoch +  batch_idx * B
-        beta = self.beta_schedule( global_it)
-
-        # Encdoer
-        z_mu, z_logvar = self.run_encoder(y, c)
-
-        # Reparametrize latent space
+    def training_step(self, batch):
+        z_mu = torch.zeros(self.model.decoder.zdim, device=self.device)[None]
+        z_logvar = torch.ones(self.model.decoder.zdim, device=self.device)[None]
         z = self.model.reparameterize(z_mu, z_logvar)
 
-        # Decoder
-        y_recon,y_recon_real, mask, struct = self.run_decoder(z,rot, c)
+        struct = self.model.decoder.structure_decoder(z)
 
-        # Write debug
-        if self.args.debug and self.trainer.is_global_zero and ((global_it)%100 == 0  or batch_idx ==0):
-            self.write_debug(struct, mask, y, y_real, y_recon, y_recon_real, global_it)
-
-        # Computing loss
-        loss, gen_loss, kld = self.loss_function(
-            z_mu,
-            z_logvar,
-            y_real,
-            y_recon_real,
-            mask,
-            beta,
-            struct=struct
+        struct.update(
+            compute_renamed_ground_truth(
+                struct,
+                struct["sm"]["positions"][-1],
+            )
         )
 
-        # Logging
-        self.log("loss", loss, prog_bar=True, sync_dist=True, on_epoch=True, on_step=True)
-        self.log("kld", kld, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True)
-        for k,v in gen_loss.items():
-            self.log(k, v, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True)
-
-        return loss
-
-
-    def validation_step(self, batch, batch_idx):
-        y, _, _, _, c = self.prepare_batch(batch)
-        z_mu, z_logvar = self.run_encoder(y, c)
-        self.val_z_mu.append(z_mu)
-        self.val_z_logvar.append(z_logvar)
-    
-    def on_validation_epoch_end(self):
-        if self.trainer.is_global_zero: 
-            
-            z_mu_all = torch.cat(self.val_z_mu).to(torch.float32).detach().cpu().numpy()
-            z_logvar_all = torch.cat(self.val_z_logvar).to(torch.float32).detach().cpu().numpy()
-
+        loss = fape_loss(
+            out =struct,
+            batch = struct,
+            config = self.model.decoder.loss_config.fape)
+        
+        if self.current_epoch%100 == 0:
 
             out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
             out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
+            out_pdb = "{}/fit.{}.pdb".format(self.args.outdir, self.current_epoch)
 
             
-            save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu_all, z_logvar_all, out_weights, out_z)
-            self.val_z_mu.clear()
-            self.val_z_logvar.clear() 
+            save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu, z_logvar, out_weights, out_z)
+            struct_to_pdb(tensor_tree_map(lambda x: x.detach().cpu().numpy()[-1], struct), out_pdb)
 
-    # def on_validation_epoch_end(self):
-
-    #     z_mu_local = torch.cat(self.val_z_mu, dim=0).detach().cpu().numpy()
-    #     z_logvar_local = torch.cat(self.val_z_logvar, dim=0).detach().cpu().numpy()
-
-    #     world_size = torch.distributed.get_world_size()
-    #     gathered_mu, gathered_logvar = [None]*world_size, [None]*world_size
-
-    #     torch.distributed.all_gather_object(gathered_mu, z_mu_local)
-    #     torch.distributed.all_gather_object(gathered_logvar, z_logvar_local)
-
-    #     if torch.distributed.get_rank() == 0:
-    #         z_mu_all = np.concatenate(gathered_mu, axis=0)
-    #         z_logvar_all = np.concatenate(gathered_logvar, axis=0)
-    #         out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
-    #         out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
-            
-    #         save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu_all, z_logvar_all, out_weights, out_z)
-    
-
-    def loss_function(
-            self,
-            z_mu,
-            z_logvar,
-            y,
-            y_recon,
-            mask,
-            beta,
-            struct,
-        ):
-
-        # Reconstruction loss
-        data_loss = torch.mean(1-get_cc(y, y_recon))
-
-        # Struct violations loss
-        struct_violations = find_structural_violations(
-            struct,
-            struct["sm"]["positions"][-1],
-            **self.model.decoder.loss_config.violation,
-        )
-        viol_loss = violation_loss(
-                    struct_violations,
-                    **{**struct, **self.model.decoder.loss_config.violation},
-                )
-
-        # Torsion angle loss
-        chi_loss = supervised_chi_loss(
-                    struct["sm"]["angles"],
-                    struct["sm"]["unnormalized_angles"],
-                    **{**struct, **self.model.decoder.loss_config.supervised_chi},
-                )
-                
-        # Center Loss
-        # crd = struct_to_crd(struct, ca=not self.model.decoder.all_atom)
-        # crd = crd @ self.model.decoder.rot_init + self.model.decoder.trans_init[..., None, :]
-        # center_loss = torch.mean(torch.sum((torch.mean(crd, dim=-2) ** 2 ), dim=-1))
-        center_loss = 0.0
-
-        # TOTAL GEN LOSS
-        gen_loss = {
-            "data_loss": data_loss, 
-            "chi_loss" : chi_loss, 
-            "viol_loss": viol_loss,
-            "center_loss": center_loss,
-            }
-        total_gen_loss = (
-            data_loss * self.args.data_loss_weight + 
-            chi_loss * self.args.chi_loss_weight +
-            viol_loss * self.args.viol_loss_weight +
-            center_loss * self.args.center_loss_weight
-        )
-
-        # latent loss
-        kld = torch.mean(
-            -0.5 * torch.sum(1 + z_logvar - z_mu.pow(2) - z_logvar.exp(), dim=1), dim=0
-        )
-        if torch.isnan(kld):
-            logger.info(z_mu[0])
-            logger.info(z_logvar[0])
-            raise RuntimeError("KLD is nan")
-
-        # total loss
-        if self.args.beta_control is None:
-            loss = total_gen_loss + beta * kld / mask.sum().float()
-        else:
-            loss =  total_gen_loss+ self.args.beta_control * (beta - kld) ** 2 / mask.sum().float()
-
-        return loss, gen_loss, kld
+        return loss
 
 def save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z):
     """Save model weights, latent encoding z, and decoder volumes"""
@@ -933,153 +637,80 @@ def save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z):
         pickle.dump(z_mu, f)
         pickle.dump(z_logvar, f)
 
+class DummyDataset(Dataset):
+    def __init__(self):
+        super().__init__()
 
-class LitDataModule(pl.LightningDataModule):
+    def __len__(self):
+        return 1  # Only one element total
+
+    def __getitem__(self, idx):
+        return torch.empty(0)
+
+
+class DummyDataModule(pl.LightningDataModule):
     def __init__(self, args):
         super().__init__()
         self.args = args
 
     def setup(self, stage=None):
-        args = self.args
-        if args.ind is not None:
-            logger.info("Filtering image dataset with {}".format(args.ind))
-            ind = pickle.load(open(args.ind, "rb"))
-        else:
-            ind = None
-
         # optionally split data if needed; skip if you only have train
-        self.train_data = dataset.ImageDataset(
-            mrcfile=args.particles,
-            lazy=args.lazy,
-            norm=args.norm,
-            invert_data=args.invert_data,
-            ind=ind,
-            window=args.window,
-            datadir=args.datadir,
-            window_r=args.window_r,
-            max_threads=args.max_threads,
-        )
-
+        self.train_data = DummyDataset()
 
     def train_dataloader(self):
-        args = self.args
-        return dataset.make_dataloader(
-            self.train_data,
-            batch_size=self.args.batch_size,
-            num_workers=args.num_workers,
-            shuffler_size=self.args.shuffler_size,
-            seed=self.args.shuffle_seed,
-        )
-
+        return DataLoader(self.train_data, batch_size=1)
     def val_dataloader(self):
-        args = self.args
-        return dataset.make_dataloader(
-            self.train_data,
-            batch_size=self.args.batch_size,
-            num_workers=args.num_workers,
-            shuffler_size=self.args.shuffler_size,
-            seed=self.args.shuffle_seed,
-            shuffle=False
-        )
+        return DataLoader(self.train_data, batch_size=1)
+
     
 def main(args: argparse.Namespace) -> None:
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
-    torch.autograd.set_detect_anomaly(True)
-    t1 = dt.now()
+
     if args.outdir is not None and not os.path.exists(args.outdir):
         os.makedirs(args.outdir)
 
-    ################################################################################""
     if args.overwrite:
         os.system("rm -rvf %s/*"%args.outdir )
-    ################################################################################""
 
-
-    logger.addHandler(logging.FileHandler(f"{args.outdir}/run.log"))
-    logger.info(" ".join(sys.argv))
-    logger.info(args)
-
-    # set the random seed ------------------------------------------------------------------------------------------------------------------------
     pl.seed_everything(args.seed)
 
     # load dataset ------------------------------------------------------------------------------------------------------------------------
-    logger.info(f"Loading dataset from {args.particles}")
-    assert not ((args.domain != "real") and (args.encode_mode == "conv"))
-    datamodule = LitDataModule(args)
+    logger.info(f"Loading dataset")
+    datamodule = DummyDataModule(args)
     datamodule.setup()
 
     # load model ------------------------------------------------------------------------------------------------------------------------
-    model = LitHetOnlyVAE(args, datamodule.train_data.D, datamodule.train_data.N)
-
-    if args.load:
-        logger.info("Loading checkpoint from {}".format(args.load))
-        checkpoint = torch.load(args.load)
-        # filter unwanted keys
-        exclude_prefixes = [
-            "lattice",
-            "decoder.embeddings",
-        ]
-        exclude_exact = {"decoder.rot_init", "decoder.trans_init"}
-
-        filtered_state_dict = {
-            k: v for k, v in checkpoint["model_state_dict"].items()
-            if not any(k.startswith(p) for p in exclude_prefixes)
-            and k not in exclude_exact
-        }
-
-        # now load
-        missing, unexpected = model.model.load_state_dict(filtered_state_dict, strict=False)
-        print("Missing keys:", missing)
-        print("Unexpected keys:", unexpected)
-
-        # optim = model.configure_optimizers()
-        # optim.load_state_dict(checkpoint["optimizer_state_dict"])
-        logger.info("Successfully restored states from {}".format(args.load))
+    model = LitHetOnlyVAE(args, 128 + 1, 100000)
 
     # save configuration
     out_config = "{}/config.yaml".format(args.outdir)
-    save_config(args, datamodule.train_data, model.model.lattice, out_config)
+    save_config(args,out_config)
 
-    # checkpoint_callback = pl.callbacks.ModelCheckpoint(
-    #     dirpath=args.outdir,          # where to save
-    #     filename="ckpt",  # filename pattern
-    #     monitor="loss",              # what metric to track
-    #     save_top_k=3,                    # save the 3 best models
-    #     mode="min",                      # "min" for loss, "max" for accuracy, etc.
-    #     save_last=False,                  # also save 'last.ckpt'
-    #     verbose=True,
-    # )
-
-    cluster_environment = MPIEnvironment() if args.mpi_plugin else None
-
-    n_devices = torch.cuda.device_count() if args.devices == "auto" else int(args.devices)
-
-    if n_devices >1:
-        strategy = DDPStrategy(find_unused_parameters=False,
-                                cluster_environment=cluster_environment,
-                                process_group_backend="nccl")
-                                # process_group_backend="gloo")
-    else:
-        strategy="auto"
-
-
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        dirpath=args.outdir,          # where to save
+        filename="ckpt",  # filename pattern
+        monitor="loss",              # what metric to track
+        save_top_k=3,                    # save the 3 best models
+        mode="min",                      # "min" for loss, "max" for accuracy, etc.
+        save_last=False,                  # also save 'last.ckpt'
+        verbose=True,
+    )
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
         accelerator="auto",
-        strategy=strategy,
-        devices=n_devices, 
-        precision=args.precision,
+        strategy="auto",
+        # strategy=DDPStrategy(),
+        devices=1,                 # or >1 for multi-GPU
+        precision=args.precision,  # AMP support
         log_every_n_steps=10,
-        callbacks=None,
-        num_nodes = args.num_nodes ,
-        logger=CSVLogger(args.outdir, name="", version=""),
-        enable_model_summary=True,
+        callbacks=checkpoint_callback,           # optional callbacks like ModelCheckpoint
+        logger=CSVLogger(args.outdir, name="", version="")
     )
 
-    trainer.fit(model, datamodule=datamodule)
-    
+    trainer.fit(model, datamodule=datamodule, ckpt_path=args.load)
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser= add_args(parser)

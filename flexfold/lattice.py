@@ -194,39 +194,31 @@ class Lattice(torch.nn.Module):
         Translate image in real space.
 
         Inputs:
-            img: (B x H x W) or (B x N)
+            img: (B x N x N)
             t: translation in pixels (B x 2) -> [shift_y, shift_x]
 
         Returns:
             Translated image (same shape as input)
         """
-        B = img.shape[0]
 
-        # For 2D images
-        if img.ndim == 3:  # B x H x W
-            B, H, W = img.shape
-            grid_y, grid_x = torch.meshgrid(
-                torch.arange(H, device=img.device), torch.arange(W, device=img.device), indexing='ij'
-            )
-            grid = torch.stack([grid_y, grid_x], dim=-1).float()  # H x W x 2
+        B, N, _ = img.shape
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(N, device=img.device), torch.arange(N, device=img.device), indexing='ij'
+        )
+        grid = torch.stack([grid_y, grid_x], dim=-1).float()  # N x N x 2
 
-            img_translated = []
-            for b in range(B):
-                coords = grid - t[b]  # shift coords
-                coords = coords.unsqueeze(0).unsqueeze(0)  # 1 x 1 x H x W x 2
-                # normalize to [-1,1] for grid_sample
-                coords_norm = coords.clone()
-                coords_norm[..., 0] = 2 * coords_norm[..., 0] / (H - 1) - 1
-                coords_norm[..., 1] = 2 * coords_norm[..., 1] / (W - 1) - 1
-                img_b = img[b:b+1].unsqueeze(1)  # 1 x 1 x H x W
-                img_trans = torch.nn.functional.grid_sample(img_b, coords_norm, mode='bilinear', padding_mode='zeros', align_corners=True)
-                img_translated.append(img_trans.squeeze(1))
-            return torch.cat(img_translated, dim=0)
+        coords = grid[None,:,:,:] - t[:, None,:, :]  # B x N x N x 2
+        coords = 2*coords / (N-1) -1
 
-        else:
-            # For 1D/unraveled images, just roll along axis
-            return torch.roll(img, shifts=t.int().squeeze(-1), dims=-1)
-    
+        img_trans = torch.nn.functional.grid_sample(
+            img[:, None, :, :], 
+            coords, 
+            mode='bilinear', 
+            padding_mode='zeros', 
+            align_corners=True
+        )
+        return img_trans[:, -1 , :, :]
+
 class EvenLattice(Lattice):
     """For a DxD lattice where D is even, we set D/2,D/2 pixel to the center"""
 

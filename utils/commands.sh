@@ -95,7 +95,7 @@ python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajector
 python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt
 #******************************************************
 BASE_DIR="../cryofold/particlesSNR1.0"
-RUN_DIR=$BASE_DIR/bench_real_direct
+RUN_DIR=$BASE_DIR/bench_frozen_sm_pair_stack
 python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
     --poses $BASE_DIR/particles.pkl \
     --ctf $BASE_DIR/ctf.pkl \
@@ -108,7 +108,7 @@ python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
     --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
     --initial_pose_path $BASE_DIR/initial_pose.pt \
     --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
-    --batch-size 64  \
+    --batch-size 32  \
     --num-workers 0 \
     --zdim 4  \
     --enc-dim 256 \
@@ -117,7 +117,37 @@ python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
     --dec-layers 3 \
     --domain fourier \
     --all_atom \
-    --overwrite
+    --overwrite\
+    --frozen_structure_module\
+    --pair_stack
+python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
+python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt
+#******************************************************
+BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/bench_conv
+python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 2.2 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --af_decoder \
+    --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
+    --initial_pose_path $BASE_DIR/initial_pose.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --batch-size 32  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 256 \
+    --enc-layers 3 \
+    --dec-dim 128 \
+    --dec-layers 3 \
+    --domain fourier \
+    --all_atom \
+    --overwrite\
+    --encode-mode conv
 python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
 python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt
 
@@ -282,3 +312,124 @@ cryodrgn backproject_voxel $BASE_DIR/Particles/particles.mrcs --poses $BASE_DIR/
 python ./scripts/compute_initial_pose.py $BASE_DIR/initial_pose_auto --backproject_path $BASE_DIR/backproject/backproject.mrc\
   --embedding_pdb_path data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run_target/fit.4000.pdb \
     --dist_search 5 --grid_size 100 --pixel_size 3.0 --sigma 1.05 --real_space --overwrite
+
+
+
+
+#*DIRECT REAL *****************************************************
+BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/bench_all_real
+python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 2.2 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --af_decoder \
+    --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
+    --initial_pose_path $BASE_DIR/initial_pose.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --batch-size 64  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 256 \
+    --enc-layers 3 \
+    --dec-dim 128 \
+    --dec-layers 3 \
+    --domain fourier \
+    --all_atom\
+    --overwrite\
+    --debug
+python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
+python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt
+
+
+#*DIRECT REAL *****************************************************
+BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/bench_conv_pair_stack
+python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 2.2 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
+    --initial_pose_path $BASE_DIR/initial_pose.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --batch-size 64  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 64 \
+    --enc-layers 4 \
+    --dec-dim 128 \
+    --dec-layers 2 \
+    --domain real \
+    --encode-mode conv \
+    --all_atom\
+    --overwrite\
+    --frozen_structure_module\
+    --pair_stack
+python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
+python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt
+
+#*DIRECT REAL *****************************************************
+BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/bench_conv
+python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 2.2 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
+    --initial_pose_path $BASE_DIR/initial_pose.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --batch-size 64  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 64 \
+    --enc-layers 4 \
+    --dec-dim 128 \
+    --dec-layers 3 \
+    --domain real \
+    --encode-mode conv \
+    --all_atom\
+    --overwrite
+python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
+python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt
+
+#*DIRECT REAL *****************************************************
+BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/bench_conv_pair_stack_shallow
+python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 2.2 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
+    --initial_pose_path $BASE_DIR/initial_pose.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --batch-size 64  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 64 \
+    --enc-layers 4 \
+    --dec-dim 64 \
+    --dec-layers 4 \
+    --domain real \
+    --encode-mode conv \
+    --all_atom\
+    --overwrite\
+    --frozen_structure_module\
+    --pair_stack
+python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
+python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt

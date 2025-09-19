@@ -34,7 +34,6 @@ class ImageDataset(torch.utils.data.Dataset):
         mrcfile,
         lazy=True,
         norm=None,
-        keepreal=False,
         invert_data=False,
         ind=None,
         window=True,
@@ -43,7 +42,6 @@ class ImageDataset(torch.utils.data.Dataset):
         max_threads=16,
         device: Union[str, torch.device] = "cpu",
     ):
-        assert not keepreal, "Not implemented yet"
         datadir = datadir or ""
         self.ind = ind
         self.src = ImageSource.from_file(
@@ -110,8 +108,14 @@ class ImageDataset(torch.utils.data.Dataset):
             data *= -1
         data = fft.symmetrize_ht(data)
         data = (data - self.norm[0]) / self.norm[1]
+        return data
 
-
+    def _process_real(self, data):
+        if data.ndim == 2:
+            data = data[np.newaxis, ...]
+        if self.invert_data:
+            data *= -1
+        data = (data - self.norm[0]) / self.norm[1]
         return data
     
     def __len__(self):
@@ -121,8 +125,10 @@ class ImageDataset(torch.utils.data.Dataset):
         if isinstance(index, list):
             index = torch.Tensor(index).to(torch.long)
 
-        particles = self._process(self.src.images(index))
-        particles_ft = self._process_ft(self.src.images(index))
+        imgs = self.src.images(index)
+        particles = self._process(imgs)
+        particles_ft = self._process_ft(imgs)
+        particles_real = self._process_real(imgs)
 
         # this is why it is tricky for index to be allowed to be a list!
         if len(particles.shape) == 2:
@@ -136,7 +142,7 @@ class ImageDataset(torch.utils.data.Dataset):
                 f" ({index[0]}..{index[-1]})"
             )
 
-        return particles, self.src.images(index),particles_ft, index
+        return particles, particles_real, particles_ft, index
 
     def get_slice(
         self, start: int, stop: int
