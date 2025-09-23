@@ -67,6 +67,10 @@ def ifft2_center(img: torch.Tensor) -> torch.Tensor:
 
     return fftshift(ifft2(fftshift(img, dim=(-1, -2))), dim=(-1, -2))
 
+def unsymmetrize_ht(x: torch.Tensor) -> torch.Tensor:
+    D = x.shape[-1]
+    assert D % 2 != 0
+    return x[..., 0:-1, 0:-1] 
 
 
 def weighted_normalized_l2(F_pred, F_target, weights, eps=1e-8):

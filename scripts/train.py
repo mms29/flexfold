@@ -60,7 +60,14 @@ from flexfold.pose import PoseTracker
 from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb,weighted_normalized_l2, gaussian_weight, frequency_weights
 from pytorch_lightning.strategies import DDPStrategy
 from scipy.ndimage import gaussian_filter
-from flexfold.core import ifft2_center
+from flexfold.core import ifft2_center, unsymmetrize_ht
+
+def pad_to_max(tensor, max_size):
+    pad_size = max_size - tensor.size(0)
+    if pad_size > 0:
+        padding = (0, 0) * (tensor.dim() - 1) + (0, pad_size)  # pad last dim only
+        tensor = F.pad(tensor, padding, value=-1)
+    return tensor
 
 def print_model_summary(model):
     total_params = 0
@@ -599,6 +606,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         self.val_z_mu = []
         self.val_z_logvar = []
+        self.val_z_idx = []
 
         if self.args.frozen_structure_module:
             for param in self.model.decoder.structure_module.parameters():
@@ -758,7 +766,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         # Real space
         y_recon_real = y_recon.reshape(B, D,D)
-        y_recon_real = fft.unsymmetrize_ht(y_recon_real)
+        y_recon_real = unsymmetrize_ht(y_recon_real)
         y_recon_real = ifft2_center(y_recon_real).real
 
         return y_recon, y_recon_real, mask, struct
@@ -808,45 +816,62 @@ class LitHetOnlyVAE(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
+        idx = batch[-1]
         y, _, _, _, c = self.prepare_batch(batch)
         z_mu, z_logvar = self.run_encoder(y, c)
+
         self.val_z_mu.append(z_mu)
         self.val_z_logvar.append(z_logvar)
-    
+        self.val_z_idx.append(idx)
+
+
     def on_validation_epoch_end(self):
+
+        # Stack tensors from local GPU
+        z_mu = torch.cat(self.val_z_mu, dim=0)
+        z_logvar = torch.cat(self.val_z_logvar, dim=0)
+        z_idx = torch.cat(self.val_z_idx, dim=0)
+
+        batch_size = torch.tensor(z_mu.size(0), device=z_mu.device)
+        max_size = self.all_gather(batch_size).max()
+
+        z_mu = pad_to_max(z_mu, max_size)
+        z_logvar = pad_to_max(z_logvar, max_size)
+        z_idx = pad_to_max(z_idx, max_size)
+
+        # Gather across all GPUs
+        z_mu = self.all_gather(z_mu)
+        z_logvar = self.all_gather(z_logvar)
+        z_idx = self.all_gather(z_idx)
+
+        # Remove padded entries (idx == -1)
+        valid_mask = z_idx != -1
+        z_mu = z_mu[valid_mask]
+        z_logvar = z_logvar[valid_mask]
+        z_idx = z_idx[valid_mask]
+
+        # Reorder by idx
+        def get_first_idx(A):
+            unique, idx, counts = torch.unique(A, sorted=True, return_inverse=True, return_counts=True)
+            _, ind_sorted = torch.sort(idx, stable=True)
+            cum_sum = counts.cumsum(0)
+            cum_sum = torch.cat((torch.tensor([0], device=A.device), cum_sum[:-1]))
+            return ind_sorted[cum_sum]
+        sorted_idx = get_first_idx(z_idx)
+        z_mu = z_mu[sorted_idx]
+        z_logvar = z_logvar[sorted_idx]
+        z_idx = z_idx[sorted_idx]
+
+        assert  torch.all(z_idx[1:] - z_idx[:-1] == 1), "not continuous!"
+
+        self.val_z_mu.clear()
+        self.val_z_logvar.clear() 
+        self.val_z_idx.clear() 
+
         if self.trainer.is_global_zero: 
-            
-            z_mu_all = torch.cat(self.val_z_mu).to(torch.float32).detach().cpu().numpy()
-            z_logvar_all = torch.cat(self.val_z_logvar).to(torch.float32).detach().cpu().numpy()
-
-
-            out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
             out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
-
-            
-            save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu_all, z_logvar_all, out_weights, out_z)
-            self.val_z_mu.clear()
-            self.val_z_logvar.clear() 
-
-    # def on_validation_epoch_end(self):
-
-    #     z_mu_local = torch.cat(self.val_z_mu, dim=0).detach().cpu().numpy()
-    #     z_logvar_local = torch.cat(self.val_z_logvar, dim=0).detach().cpu().numpy()
-
-    #     world_size = torch.distributed.get_world_size()
-    #     gathered_mu, gathered_logvar = [None]*world_size, [None]*world_size
-
-    #     torch.distributed.all_gather_object(gathered_mu, z_mu_local)
-    #     torch.distributed.all_gather_object(gathered_logvar, z_logvar_local)
-
-    #     if torch.distributed.get_rank() == 0:
-    #         z_mu_all = np.concatenate(gathered_mu, axis=0)
-    #         z_logvar_all = np.concatenate(gathered_logvar, axis=0)
-    #         out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
-    #         out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
-            
-    #         save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu_all, z_logvar_all, out_weights, out_z)
-    
+            out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
+            save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu, z_logvar, out_weights, out_z)
 
     def loss_function(
             self,
@@ -917,7 +942,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         return loss, gen_loss, kld
 
-def save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z):
+def save_checkpoint(model, optim, epoch, z_mu,z_logvar, out_weights, out_z):
     """Save model weights, latent encoding z, and decoder volumes"""
     # save model weights
     torch.save(
@@ -928,11 +953,15 @@ def save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z):
         },
         out_weights,
     )
-    # save z
     with open(out_z, "wb") as f:
         pickle.dump(z_mu, f)
         pickle.dump(z_logvar, f)
 
+def load_z(out_z):
+    with open(out_z, "rb") as f:
+        z_mu = pickle.load(f)
+        z_logvar = pickle.load(f)
+    return z_mu, z_logvar
 
 class LitDataModule(pl.LightningDataModule):
     def __init__(self, args):
@@ -983,7 +1012,6 @@ class LitDataModule(pl.LightningDataModule):
         )
     
 def main(args: argparse.Namespace) -> None:
-
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     torch.autograd.set_detect_anomaly(True)

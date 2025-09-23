@@ -846,8 +846,6 @@ class AFDecoder(torch.nn.Module):
         outputs["final_atom_mask"] = embedding_expand["atom37_atom_exists"]
         outputs["final_affine_tensor"] = outputs["sm"]["frames"][-1]
 
-        print(outputs["final_atom_positions"].dtype)
-
         for k, v in embedding_expand.items():
             if k not in outputs : 
                 outputs[k] = v
