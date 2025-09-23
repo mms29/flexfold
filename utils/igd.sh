@@ -9,3 +9,34 @@ python scripts/run_pretrained_openfold.py  ../cryofold/cryobench_IgD/new_preds  
                                           --output_dir data/cryofold/cryobench_IgD/test          --embeddings_output_path data/cryofold/cryobench_IgD/test/test.pt  \
                                               --use_precomputed_alignments data/cryofold/cryobench_IgD/alignments/      --data_random_seed 43 
 
+
+BASE_DIR="../cryofold/cryobench_IgD/IgG-1D/images/snr0.01"
+RUN_DIR=$BASE_DIR/run_target_conv
+
+python -u ./scripts/train_target.py \
+    $BASE_DIR/sorted_particles.128.txt  \
+    --poses  $BASE_DIR/particles.pkl\
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 10000 \
+    -o $RUN_DIR \
+    --pixel_size 3.0 \
+    --sigma 1.05\
+    --quality_ratio 5.0 \
+    --embedding_path ~/cryofold/cryobench_IgD/pred2/embeddings.pt  \
+    --initial_pose_path $BASE_DIR/initial_pose_dummy.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/params/params_model_3_multimer_v3.npz \
+    --batch-size 1  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 64 \
+    --enc-layers 5 \
+    --dec-dim 128 \
+    --dec-layers 3 \
+    --domain real \
+    --encode-mode conv \
+    --use_lma \
+    --pair_stack \
+    --frozen_structure_module \
+    --target_file ~/cryofold/cryobench_IgD/1HZH.cif \
+    --overwrite \
+    --multimer 

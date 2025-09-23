@@ -28,6 +28,38 @@ from torch.utils.data.sampler import BatchSampler, RandomSampler, SequentialSamp
 logger = logging.getLogger(__name__)
 
 
+class DataSplits(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        imageDataset,
+        indices,
+    ):    
+        self.indices = indices
+        self.N = len(indices)
+        self.imageDataset = imageDataset
+        self.D = self.imageDataset.D
+        self.domain = self.imageDataset.domain
+        self.src = self.imageDataset.src
+
+    def __len__(self):
+        return self.N
+
+    def __getitem__(self, index):
+        return self.imageDataset(self.indices[index])
+    
+    def get_slice(self, start, stop) :
+        return (
+            self.src.images(slice(self.indices[start], self.indices[stop]), require_contiguous=True).numpy(),
+            None,
+        )
+    
+    def _process(self, data):
+        return self.imageDataset._process(data)
+    def _process_real(self, data):
+        return self.imageDataset._process_real(data)
+    def _process_ft(self, data):
+        return self.imageDataset._process_ft(data)
+
 class ImageDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -41,7 +73,9 @@ class ImageDataset(torch.utils.data.Dataset):
         window_r=0.85,
         max_threads=16,
         device: Union[str, torch.device] = "cpu",
+        domain="real",
     ):
+        self.domain=domain
         datadir = datadir or ""
         self.ind = ind
         self.src = ImageSource.from_file(
@@ -126,9 +160,14 @@ class ImageDataset(torch.utils.data.Dataset):
             index = torch.Tensor(index).to(torch.long)
 
         imgs = self.src.images(index)
-        particles = self._process(imgs)
-        particles_ft = self._process_ft(imgs)
+
         particles_real = self._process_real(imgs)
+        if self.domain=="hartley":
+            particles = self._process(imgs)
+        elif self.domain=="fourier":
+            particles = self._process_ft(imgs)
+        else:
+            particles=None
 
         # this is why it is tricky for index to be allowed to be a list!
         if len(particles.shape) == 2:
@@ -142,7 +181,7 @@ class ImageDataset(torch.utils.data.Dataset):
                 f" ({index[0]}..{index[-1]})"
             )
 
-        return particles, particles_real, particles_ft, index
+        return particles, particles_real, index
 
     def get_slice(
         self, start: int, stop: int
@@ -151,203 +190,6 @@ class ImageDataset(torch.utils.data.Dataset):
             self.src.images(slice(start, stop), require_contiguous=True).numpy(),
             None,
         )
-
-
-class TiltSeriesData(ImageDataset):
-    """
-    Class representing tilt series
-    """
-
-    def __init__(
-        self,
-        tiltstar,
-        ntilts,
-        random_tilts=False,
-        ind=None,
-        voltage=None,
-        expected_res=None,
-        dose_per_tilt=None,
-        angle_per_tilt=None,
-        **kwargs,
-    ):
-        # Note: ind is the indices of the *tilts*, not the particles
-        super().__init__(tiltstar, ind=ind, **kwargs)
-
-        # Parse unique particles from _rlnGroupName
-        star_df, _ = parse_star(tiltstar)
-        assert isinstance(self.src, StarfileSource)
-        # star_df = self.src.df
-        if ind is not None:
-            star_df = star_df.loc[ind]
-        group_name = list(star_df["_rlnGroupName"])
-        particles = OrderedDict()
-        for ii, gn in enumerate(group_name):
-            if gn not in particles:
-                particles[gn] = []
-            particles[gn].append(ii)
-        self.particles = [np.asarray(pp, dtype=int) for pp in particles.values()]
-        self.Np = len(particles)
-        self.ctfscalefactor = np.asarray(
-            star_df["_rlnCtfScalefactor"], dtype=np.float32
-        )
-        self.tilt_numbers = np.zeros(self.N)
-        for ind in self.particles:
-            sort_idxs = self.ctfscalefactor[ind].argsort()
-            ranks = np.empty_like(sort_idxs)
-            ranks[sort_idxs[::-1]] = np.arange(len(ind))
-            self.tilt_numbers[ind] = ranks
-        self.tilt_numbers = torch.tensor(self.tilt_numbers).to(self.device)
-        logger.info(f"Loaded {self.N} tilts for {self.Np} particles")
-        counts = Counter(group_name)
-        unique_counts = set(counts.values())
-        logger.info(f"{unique_counts} tilts per particle")
-        self.counts = counts
-        assert ntilts <= min(unique_counts)
-        self.ntilts = ntilts
-        self.random_tilts = random_tilts
-
-        self.voltage = voltage
-        self.dose_per_tilt = dose_per_tilt
-
-        # Assumes dose-symmetric tilt scheme
-        # As implemented in Hagen, Wan, Briggs J. Struct. Biol. 2017
-        self.tilt_angles = None
-        if angle_per_tilt is not None:
-            self.tilt_angles = angle_per_tilt * torch.ceil(self.tilt_numbers / 2)
-            self.tilt_angles = torch.tensor(self.tilt_angles).to(self.device)
-
-    def __len__(self):
-        return self.Np
-
-    def __getitem__(self, index):
-        if isinstance(index, list):
-            index = torch.Tensor(index).to(torch.long)
-        tilt_indices = []
-        for ii in index:
-            if self.random_tilts:
-                tilt_index = np.random.choice(
-                    self.particles[ii], self.ntilts, replace=False
-                )
-            else:
-                # take the first ntilts
-                tilt_index = self.particles[ii][0 : self.ntilts]
-            tilt_indices.append(tilt_index)
-        tilt_indices = np.concatenate(tilt_indices)
-        images = self._process(self.src.images(tilt_indices).to(self.device))
-        return images, tilt_indices, index
-
-    @classmethod
-    def parse_particle_tilt(
-        cls, tiltstar: str
-    ) -> tuple[list[np.ndarray], dict[np.int64, int]]:
-        # Parse unique particles from _rlnGroupName
-        star_df, _ = parse_star(tiltstar)
-        group_name = list(star_df["_rlnGroupName"])
-        particles = OrderedDict()
-
-        for ii, gn in enumerate(group_name):
-            if gn not in particles:
-                particles[gn] = []
-            particles[gn].append(ii)
-
-        particles = [np.asarray(pp, dtype=int) for pp in particles.values()]
-        particles_to_tilts = particles
-        tilts_to_particles = {}
-
-        for i, j in enumerate(particles):
-            for jj in j:
-                tilts_to_particles[jj] = i
-
-        return particles_to_tilts, tilts_to_particles
-
-    @classmethod
-    def particles_to_tilts(
-        cls, particles_to_tilts: list[np.ndarray], particles: np.ndarray
-    ) -> np.ndarray:
-        tilts = [particles_to_tilts[int(i)] for i in particles]
-        tilts = np.concatenate(tilts)
-
-        return tilts
-
-    @classmethod
-    def tilts_to_particles(cls, tilts_to_particles, tilts):
-        particles = [tilts_to_particles[i] for i in tilts]
-        particles = np.array(sorted(set(particles)))
-        return particles
-
-    def get_tilt(self, index):
-        return super().__getitem__(index)
-
-    def get_slice(self, start: int, stop: int) -> Tuple[np.ndarray, np.ndarray]:
-        # we have to fetch all the tilts to stay contiguous, and then subset
-        tilt_indices = [self.particles[index] for index in range(start, stop)]
-        cat_tilt_indices = np.concatenate(tilt_indices)
-        images = self.src.images(cat_tilt_indices, require_contiguous=True)
-
-        tilt_masks = []
-        for tilt_idx in tilt_indices:
-            tilt_mask = np.zeros(len(tilt_idx), dtype=np.bool)
-            if self.random_tilts:
-                tilt_mask_idx = np.random.choice(
-                    len(tilt_idx), self.ntilts, replace=False
-                )
-                tilt_mask[tilt_mask_idx] = True
-            else:
-                i = (len(tilt_idx) - self.ntilts) // 2
-                tilt_mask[i : i + self.ntilts] = True
-            tilt_masks.append(tilt_mask)
-        tilt_masks = np.concatenate(tilt_masks)
-        selected_images = images[tilt_masks]
-        selected_tilt_indices = cat_tilt_indices[tilt_masks]
-
-        return selected_images.numpy(), selected_tilt_indices
-
-    def critical_exposure(self, freq):
-        assert (
-            self.voltage is not None
-        ), "Critical exposure calculation requires voltage"
-
-        assert (
-            self.voltage == 300 or self.voltage == 200
-        ), "Critical exposure calculation requires 200kV or 300kV imaging"
-
-        # From Grant and Grigorieff, 2015
-        scale_factor = 1
-        if self.voltage == 200:
-            scale_factor = 0.75
-        critical_exp = torch.pow(freq, -1.665)
-        critical_exp = torch.mul(critical_exp, scale_factor * 0.245)
-        return torch.add(critical_exp, 2.81)
-
-    def get_dose_filters(self, tilt_index, lattice, Apix):
-        D = lattice.D
-
-        N = len(tilt_index)
-        freqs = lattice.freqs2d / Apix  # D/A
-        x = freqs[..., 0]
-        y = freqs[..., 1]
-        s2 = x**2 + y**2
-        s = torch.sqrt(s2)
-
-        cumulative_dose = self.tilt_numbers[tilt_index] * self.dose_per_tilt
-        cd_tile = torch.repeat_interleave(cumulative_dose, D * D).view(N, -1)
-
-        ce = self.critical_exposure(s).to(self.device)
-        ce_tile = ce.repeat(N, 1)
-
-        oe_tile = ce_tile * 2.51284  # Optimal exposure
-        oe_mask = (cd_tile < oe_tile).long()
-
-        freq_correction = torch.exp(-0.5 * cd_tile / ce_tile)
-        freq_correction = torch.mul(freq_correction, oe_mask)
-        angle_correction = torch.cos(self.tilt_angles[tilt_index] * np.pi / 180)
-        ac_tile = torch.repeat_interleave(angle_correction, D * D).view(N, -1)
-
-        return torch.mul(freq_correction, ac_tile).float()
-
-    def optimal_exposure(self, freq):
-        return 2.51284 * self.critical_exposure(freq)
-
 
 class DataShuffler:
     def __init__(
@@ -376,7 +218,6 @@ class DataShuffler:
             self.buffer_size,
             len(self.dataset),
         )
-        self.ntilts = getattr(dataset, "ntilts", 1)  # FIXME
 
     def __iter__(self):
         return _DataShufflerIterator(self)
@@ -389,16 +230,13 @@ class _DataShufflerIterator:
         self.batch_size = shuffler.batch_size
         self.batch_capacity = shuffler.batch_capacity
         self.dtype = shuffler.dtype
-        self.ntilts = shuffler.ntilts
 
         self.buffer = np.empty(
-            (self.buffer_size, self.ntilts, self.dataset.D - 1, self.dataset.D - 1),
+            (self.buffer_size, 1, self.dataset.D - 1, self.dataset.D - 1),
             dtype=self.dtype,
         )
         self.index_buffer = np.full((self.buffer_size,), -1, dtype=np.int64)
-        self.tilt_index_buffer = np.full(
-            (self.buffer_size, self.ntilts), -1, dtype=np.int64
-        )
+
         self.num_batches = (
             len(self.dataset) // self.batch_size
         )  # FIXME off-by-one? Nah, lets leave the last batch behind
@@ -408,15 +246,11 @@ class _DataShufflerIterator:
         # pre-fill
         logger.info("Pre-filling data shuffler buffer...")
         for i in range(self.batch_capacity):
-            chunk, maybe_tilt_indices, chunk_indices = self._get_next_chunk()
+            chunk, chunk_indices = self._get_next_chunk()
             self.buffer[i * self.batch_size : (i + 1) * self.batch_size] = chunk
             self.index_buffer[
                 i * self.batch_size : (i + 1) * self.batch_size
             ] = chunk_indices
-            if maybe_tilt_indices is not None:
-                self.tilt_index_buffer[
-                    i * self.batch_size : (i + 1) * self.batch_size
-                ] = maybe_tilt_indices
         logger.info(
             f"Filled buffer with {self.buffer_size} images ({self.batch_capacity} contiguous chunks)."
         )
@@ -424,20 +258,16 @@ class _DataShufflerIterator:
     def _get_next_chunk(self) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
         chunk_idx = int(self.chunk_order[self.count])
         self.count += 1
-        particles, maybe_tilt_indices = self.dataset.get_slice(
+        particles, _ = self.dataset.get_slice(
             chunk_idx * self.batch_size, (chunk_idx + 1) * self.batch_size
         )
         particle_indices = np.arange(
             chunk_idx * self.batch_size, (chunk_idx + 1) * self.batch_size
         )
         particles = particles.reshape(
-            self.batch_size, self.ntilts, *particles.shape[1:]
+            self.batch_size, 1, *particles.shape[1:]
         )
-        if maybe_tilt_indices is not None:
-            maybe_tilt_indices = maybe_tilt_indices.reshape(
-                self.batch_size, self.ntilts
-            )
-        return particles, maybe_tilt_indices, particle_indices
+        return particles, particle_indices
 
     def __iter__(self):
         return self
@@ -473,9 +303,6 @@ class _DataShufflerIterator:
             particle_indices = self.index_buffer[
                 self.flush_remaining - self.batch_size : self.flush_remaining
             ]
-            tilt_indices = self.tilt_index_buffer[
-                self.flush_remaining - self.batch_size : self.flush_remaining
-            ]
             self.flush_remaining -= self.batch_size
         else:
             indices = np.random.choice(
@@ -483,25 +310,27 @@ class _DataShufflerIterator:
             )
             particles = self.buffer[indices]
             particle_indices = self.index_buffer[indices]
-            tilt_indices = self.tilt_index_buffer[indices]
 
-            chunk, maybe_tilt_indices, chunk_indices = self._get_next_chunk()
+            chunk, chunk_indices = self._get_next_chunk()
             self.buffer[indices] = chunk
             self.index_buffer[indices] = chunk_indices
-            if maybe_tilt_indices is not None:
-                self.tilt_index_buffer[indices] = maybe_tilt_indices
 
         particles = torch.from_numpy(particles)
         particle_indices = torch.from_numpy(particle_indices)
-        tilt_indices = torch.from_numpy(tilt_indices)
 
-        # merge the batch and tilt dimension
+        # merge the batch dimension
         particles = particles.view(-1, *particles.shape[2:])
-        tilt_indices = tilt_indices.view(-1, *tilt_indices.shape[2:])
 
-        particles = self.dataset._process(particles.to(self.dataset.device))
+        particles_real = self.dataset._process_real(particles)
+        if self.dataset.domain=="hartley":
+            particles = self.dataset._process(particles)
+        elif self.dataset.domain=="fourier":
+            particles = self.dataset._process_ft(particles)
+        else:
+            particles=None
+
         # print('ZZZ', particles.shape, tilt_indices.shape, particle_indices.shape)
-        return particles, tilt_indices, particle_indices
+        return particles, particles_real, particle_indices
 
 
 def make_dataloader(

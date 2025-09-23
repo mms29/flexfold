@@ -91,7 +91,7 @@ class HetOnlyVAE(nn.Module):
         self.in_dim = in_dim
         self.enc_mask = enc_mask
         if encode_mode == "conv":
-            self.encoder = ConvEncoder(qdim, zdim * 2)
+            # self.encoder = ConvEncoder(qdim, zdim * 2)
             self.encoder = PyramidConvEncoder(qdim, zdim * 2, False, max_hidden_blocks=qlayers)
         elif encode_mode == "resid":
             self.encoder = ResidLinearMLP(
@@ -471,14 +471,22 @@ class PyramidConvEncoder(nn.Module):
 
         # Add pyramid of residual blocks until feature map ≤ min_spatial
         # We'll add 4 as a default base, but can adapt dynamically if desired
-        for _ in range(max_hidden_blocks):  # maximum 6 blocks to avoid infinite loop
+        print("=========================================================")
+        print("Pyramidal encoder architecture : ")
+        for i in range(max_hidden_blocks):
             self.layers.append(ResidualBlock(in_channels, current_hidden, stride=2))
+            print("Conv block %i (input img size %i) : %i -> %i"%(i+1,(4* 2**(max_hidden_blocks-i)), in_channels, current_hidden))
             in_channels = current_hidden
             current_hidden *= 2
+        print("=========================================================")
+
+
 
         self.attn = SelfAttention(in_channels) if use_attention else nn.Identity()
         self.proj = nn.Conv2d(in_channels, out_dim, kernel_size=1)
         self.global_pool = nn.AdaptiveAvgPool2d(1)
+
+
 
     def forward(self, x):
         B, N2 = x.shape
@@ -846,7 +854,6 @@ class AFDecoder(torch.nn.Module):
         outputs["final_atom_mask"] = embedding_expand["atom37_atom_exists"]
         outputs["final_affine_tensor"] = outputs["sm"]["frames"][-1]
 
-        print(outputs["final_atom_positions"].dtype)
 
         for k, v in embedding_expand.items():
             if k not in outputs : 

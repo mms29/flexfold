@@ -121,8 +121,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )        
     parser.add_argument(
         "--mpi_plugin", action="store_true", help="TODO"
+    )      
+    parser.add_argument(
+        "--use_lma", action="store_true", help="TODO"
     )    
-    
     parser.add_argument(
         "--quality_ratio", type=float, default=5.0, help="TODO"
     )
@@ -138,6 +140,10 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--chi_loss_weight", type=float, default=1.0, help="TODO"
     )
+    parser.add_argument(
+        "--train_val_ratio", type=float, default=0.9, help="TODO"
+    )
+    
     parser.add_argument(
         "--all_atom", action="store_true", help="TODO"
     )
@@ -158,6 +164,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--pair_stack", action="store_true", help="TODO"
+    )
+    parser.add_argument(
+        "--target_file", type=str, default=None, help="TODO"
     )
     parser.add_argument(
         "--frozen_structure_module", action="store_true", help="TODO"
@@ -500,6 +509,7 @@ def save_config(args, dataset, lattice, out_config):
         pair_stack = args.pair_stack,
         real_space = args.real_space,
         is_multimer = args.multimer,
+        target_file= args.target_file,
     )
     config = dict(
         dataset_args=dataset_args, lattice_args=lattice_args, model_args=model_args
@@ -595,6 +605,7 @@ class LitHetOnlyVAE(pl.LightningModule):
             real_space=args.real_space,
             is_multimer = args.multimer,
             af_checkpoint_path =args.af_checkpoint_path,
+            target_file=args.target_file,
         )
 
         self.val_z_mu = []
@@ -607,6 +618,7 @@ class LitHetOnlyVAE(pl.LightningModule):
         if self.domain == "real":
             self.model.enc_mask = None
 
+        self.model.decoder.globals.use_lma = args.use_lma
 
         print_model_summary(self.model)
 
@@ -947,8 +959,7 @@ class LitDataModule(pl.LightningDataModule):
         else:
             ind = None
 
-        # optionally split data if needed; skip if you only have train
-        self.train_data = dataset.ImageDataset(
+        imageDataset = dataset.ImageDataset(
             mrcfile=args.particles,
             lazy=args.lazy,
             norm=args.norm,
@@ -959,6 +970,15 @@ class LitDataModule(pl.LightningDataModule):
             window_r=args.window_r,
             max_threads=args.max_threads,
         )
+
+        indices = np.arange(imageDataset.N)
+        first_val_ind = int(self.args.train_val_ratio * imageDataset.N)
+        indices_train = indices[:first_val_ind]
+        indices_val = indices[first_val_ind:]
+
+        self.train_data = dataset.DataSplits(imageDataset, indices_train)
+        self.val_data  = dataset.DataSplits(imageDataset, indices_val)
+
 
 
     def train_dataloader(self):
@@ -973,14 +993,24 @@ class LitDataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         args = self.args
-        return dataset.make_dataloader(
-            self.train_data,
-            batch_size=self.args.batch_size,
-            num_workers=args.num_workers,
-            shuffler_size=self.args.shuffler_size,
-            seed=self.args.shuffle_seed,
-            shuffle=False
-        )
+        return [
+            dataset.make_dataloader( # This is the dataset used to validate 
+                self.val_data,
+                batch_size=self.args.batch_size,
+                num_workers=args.num_workers,
+                shuffler_size=self.args.shuffler_size,
+                seed=self.args.shuffle_seed,
+                shuffle=False
+            ),
+            dataset.make_dataloader( # This is not used in validation, I pass the rest of the data in order to record z latent projections at each validation step
+                self.train_data,
+                batch_size=self.args.batch_size,
+                num_workers=args.num_workers,
+                shuffler_size=self.args.shuffler_size,
+                seed=self.args.shuffle_seed,
+                shuffle=False
+            ),
+        ]
     
 def main(args: argparse.Namespace) -> None:
 

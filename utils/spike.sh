@@ -40,10 +40,10 @@ python -u ./scripts/train.py \
   --batch-size 1  \
   --num-workers 0 \
   --zdim 2  \
-  --enc-dim 64 \
+  --enc-dim 32 \
   --enc-layers 6 \
-  --dec-dim 64 \
-  --dec-layers 3 \
+  --dec-dim 32 \
+  --dec-layers 1 \
   --encode-mode conv\
   --domain real \
   --overwrite \

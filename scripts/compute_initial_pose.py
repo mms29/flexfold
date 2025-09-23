@@ -59,6 +59,7 @@ def main(args):
         R_final = torch.tensor(R_final)
         shift_final = torch.tensor(shift_final)
         angle_final = torch.tensor(angle_final)
+        print("RMSD:", sup.rms)
     else:
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -106,11 +107,11 @@ def main(args):
     print("Successfully written %s"%( args.outdir+".pt"))
 
     if args.from_aligned_pdb:
-        sup.apply(structure2.get_atoms())  # transforms all atoms of structure2
+        sup.apply(structure1.get_atoms())  # transforms all atoms of structure2
 
         # Write the aligned structure to a new PDB
         io = PDBIO()
-        io.set_structure(structure2)
+        io.set_structure(structure1)
         io.save(args.outdir+".pdb")
     else:
         if args.embedding_pdb_path:
