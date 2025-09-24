@@ -823,7 +823,17 @@ class LitHetOnlyVAE(pl.LightningModule):
             self.log(k, v, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
 
         return loss
-
+    
+    def on_after_backward(self):
+        unused = []
+        for name, param in self.named_parameters():
+            if param.requires_grad and param.grad is None:
+                unused.append(name)
+        if unused:
+            print("⚠️ Unused parameters detected:")
+            for u in unused:
+                print(u)
+            print()
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         idx = batch[-1]

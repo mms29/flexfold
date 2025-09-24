@@ -665,3 +665,325 @@ def plot_loss(infile, outfile, w=10):
 infile = "/home/vuillemr/cryofold/particlesSNR1.0/run_test/metrics.csv"
 outfile = "/home/vuillemr/cryofold/particlesSNR1.0/run_test/metrics.png"
 w= 10
+
+
+
+
+
+from openfold.model.primitives import Attention
+from openfold.model.triangular_multiplicative_update import (FusedTriangleMultiplicationOutgoing,FusedTriangleMultiplicationIncoming,
+                                                             TriangleMultiplicationOutgoing,TriangleMultiplicationIncoming)
+from openfold.model.pair_transition import PairTransition
+import torch
+from openfold.model.primitives import Linear, LayerNorm, Attention
+from openfold.utils.chunk_utils import chunk_layer
+from openfold.utils.tensor_utils import (
+    permute_final_dims,
+    flatten_final_dims,
+)
+import torch.nn as nn
+from typing import Optional, List
+from functools import partialmethod, partial
+from openfold.model.dropout import DropoutRowwise, DropoutColumnwise
+from openfold.utils.tensor_utils import add
+from openfold.utils.checkpointing import checkpoint_blocks
+
+class TriangleCrossAttention(nn.Module):
+    def __init__(
+        self, c_q, c_kv, c_hidden, no_heads, inf=1e9
+    ):
+        super(TriangleCrossAttention, self).__init__()
+        self.c_q = c_q
+        self.c_kv = c_kv
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.inf = inf
+        self.layer_norm = LayerNorm(self.c_q)
+        # self.linear = Linear(self.c_q, self.no_heads, bias=False, init="normal")
+        self.mha = Attention(
+            self.c_q, self.c_kv, self.c_kv, self.c_hidden, self.no_heads
+        )
+
+    def forward(self, 
+        x: torch.Tensor, 
+        z: torch.Tensor, 
+        mask: Optional[torch.Tensor] = None,
+        chunk_size: Optional[int] = None,
+        inplace_safe: bool = False,
+        **kwargs
+    ) -> torch.Tensor:
+
+        if mask is None:
+            # [*, I, J]
+            mask = x.new_ones(
+                x.shape[:-1],
+            )
+
+        print("Input x ->",x.requires_grad)
+        print("Input z ->",z.requires_grad)
+        # [*, I, J, C_in]
+        x = self.layer_norm(x)        
+        print("Layer Norm x->",x.requires_grad)
+        print("Layer Norm z->",z.requires_grad)
+
+
+        # [*, I, 1, 1, J]
+        mask_bias = (self.inf * (mask - 1))[..., :, None, :, None]
+        biases = [mask_bias]
+        print("Mask ->",mask.requires_grad)
+ 
+        x = self.mha(
+                q_x=x, 
+                kv_x=z, 
+                biases=biases, 
+                **kwargs
+        )
+
+        print("Output    ->",x.requires_grad)
+        print()
+        print()
+        return x
+
+
+
+class CryoFormerBlock(nn.Module):
+    def __init__(
+        self,
+        c_z: int,
+        c_latent:int,
+        c_hidden: int,
+        no_heads: int,
+        transition_n: int,
+        dropout_rate: float,
+        inf: float,
+        eps: float
+    ):
+        super(CryoFormerBlock, self).__init__()
+
+        self.tri_att_start = TriangleCrossAttention(
+            c_z,
+            c_latent,
+            c_hidden,
+            no_heads,
+            inf=inf,
+        )
+        self.tri_att_end = TriangleCrossAttention(
+            c_z,
+            c_latent,
+            c_hidden,
+            no_heads,
+            inf=inf,
+        )
+
+        self.pair_transition = PairTransition(
+            c_z,
+            transition_n,
+        )
+        self.ps_dropout_row_layer = DropoutRowwise(dropout_rate)
+
+    def forward(self,
+        z: torch.Tensor,
+        latent:torch.Tensor,
+        pair_mask: torch.Tensor,
+        inplace_safe: bool = False,
+        chunk_size: Optional[int] = None,
+        use_deepspeed_evo_attention: bool = False,
+        use_lma: bool = False,
+        _attn_chunk_size: Optional[int] = None
+    ) -> torch.Tensor:
+        
+        print("BLOCK ")
+
+        z = add(z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_start(
+                        z,
+                        latent,
+                        mask=pair_mask,
+                        chunk_size=_attn_chunk_size,
+                        use_memory_efficient_kernel=False,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma,
+                        inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=inplace_safe,
+                )
+
+        z = z.transpose(-2, -3)
+        if (inplace_safe):
+            z = z.contiguous()
+
+        z = add(z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_end(
+                        z,
+                        latent,
+                        mask=pair_mask.transpose(-1, -2),
+                        chunk_size=_attn_chunk_size,
+                        use_memory_efficient_kernel=False,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma,
+                        inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=inplace_safe,
+                )
+
+        z = z.transpose(-2, -3)
+        if (inplace_safe):
+            z = z.contiguous()
+
+        z = add(z,
+                self.pair_transition(
+                    z, mask=None, chunk_size=chunk_size,
+                ),
+                inplace=inplace_safe,
+        )
+
+        return z
+
+class CryoFormerStack(nn.Module):
+    def __init__(
+        self,
+        c_z,
+        c_latent,
+        c_hidden,
+        no_heads,
+        no_blocks,
+        transition_n,
+        dropout_rate,
+        blocks_per_ckpt,
+        inf=1e9,
+        eps = 1e-8,
+    ):
+
+        super(CryoFormerStack, self).__init__()
+
+        self.blocks_per_ckpt = blocks_per_ckpt
+
+        self.blocks = nn.ModuleList()
+        for _ in range(no_blocks):
+            block = CryoFormerBlock(
+                c_z=c_z,
+                c_latent=c_latent,
+                c_hidden=c_hidden,
+                no_heads=no_heads,
+                transition_n=transition_n,
+                dropout_rate=dropout_rate,
+                inf=inf,
+                eps=eps,
+            )
+            self.blocks.append(block)
+
+        self.layer_norm = LayerNorm(c_z)
+
+    def forward(
+        self,
+        z: torch.tensor,
+        latent: torch.tensor,
+        mask: torch.tensor,
+        chunk_size: Optional[int] = None,
+        use_deepspeed_evo_attention: bool = False,
+        use_lma: bool = False,
+        inplace_safe: bool = False,
+    ):
+
+        blocks = [
+            partial(
+                b,
+                latent=latent,
+                pair_mask=mask,
+                chunk_size=chunk_size,
+                use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_lma=use_lma,
+                inplace_safe=inplace_safe,
+            )
+            for b in self.blocks
+        ]
+
+        z, = checkpoint_blocks(
+            blocks=blocks,
+            args=(z,),
+            blocks_per_ckpt=self.blocks_per_ckpt if self.training else None,
+        )
+
+        z = self.layer_norm(z)
+
+        return z
+
+
+
+
+
+
+
+
+
+
+
+# make sure we're on GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+B = 1
+N = 214
+c_q = 64
+c_kv = 8
+c_hidden = 16
+no_heads = 4
+transition_n = 2
+pair_dropout = 0.15
+no_blocks=2
+blocks_per_ckpt= 1 
+
+q_x = torch.zeros (1,1,N,N,c_q, device=device, requires_grad=False)
+mask = torch.ones (B,1,N,N,     device=device, requires_grad=False)
+kv_x = torch.zeros(B,1,1,1,c_kv,device=device, requires_grad=True)
+mask_bias = (1e8* (mask - 1))[..., :, None, :, None]
+biases = [mask_bias]
+a = CryoFormerStack(c_q,c_kv, c_hidden, no_heads,no_blocks, transition_n, pair_dropout,blocks_per_ckpt).to(device)
+# a = CryoFormerBlock(c_q,c_kv, c_hidden, no_heads, transition_n, pair_dropout, 1e8, 1e-9).to(device)
+# a = Attention(c_q,c_kv,c_kv, c_hidden, no_heads).to(device)
+
+
+# reset peak memory counter
+torch.cuda.reset_peak_memory_stats(device)
+
+# forward
+out = a(q_x, kv_x, mask)
+# out = a(q_x, kv_x, biases)
+
+print(out.requires_grad)
+
+
+print("After forward:")
+print(f"Allocated: {torch.cuda.memory_allocated(device)/1e6:.2f} MB")
+print(f"Peak: {torch.cuda.max_memory_allocated(device)/1e6:.2f} MB")
+
+# backward
+loss = out.pow(2).sum()
+loss.backward()
+
+print("After backward:")
+print(f"Allocated: {torch.cuda.memory_allocated(device)/1e6:.2f} MB")
+print(f"Peak: {torch.cuda.max_memory_allocated(device)/1e6:.2f} MB")
+
+
+unused = []
+used=[]
+for name, param in a.named_parameters():
+    if param.requires_grad and param.grad is None:
+        unused.append(name)
+    else:
+        used.append(name)
+if unused:
+    print("⚠️ Unused parameters detected:", unused)
+
+if used:
+    print("⚠️ Used parameters detected:", used)
+
+
+del q_x, kv_x, out, loss, a,mask
+import  gc
+gc.collect()
+torch.cuda.empty_cache()

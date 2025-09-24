@@ -498,10 +498,12 @@ python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
     --zdim 4  \
     --enc-dim 64 \
     --enc-layers 4 \
-    --dec-dim 128 \
-    --dec-layers 3 \
+    --dec-dim 96 \
+    --dec-layers 2 \
     --domain real \
     --encode-mode conv \
-    --overwrite
+    --overwrite\
+    --pair_stack
+    
 python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
 python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt

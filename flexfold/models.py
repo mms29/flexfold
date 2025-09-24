@@ -736,24 +736,41 @@ class AFDecoder(torch.nn.Module):
         self.zdim = zdim
         self.hidden_dim=hidden_dim
 
-        if self.pair_stack : 
+        self.new=True
 
-            self.input_proj = Linear(zdim, hidden_dim )
-            self.embedding_proj = Linear(self.outdim, hidden_dim )
-            self.decoder_ = TemplatePairStack(
-                    c_t=hidden_dim,
-                    c_hidden_tri_att= hidden_dim//4,
-                    c_hidden_tri_mul= hidden_dim//2,
-                    no_blocks= layers,
-                    no_heads= 4,
-                    pair_transition_n= layers,
-                    dropout_rate= 0.15,
-                    tri_mul_first=False,
-                    fuse_projection_weights= False,
-                    blocks_per_ckpt =1,
-                    tune_chunk_size=False
-            )
-            self.output_proj = Linear(hidden_dim, self.outdim )
+        if self.pair_stack : 
+            if self.new:
+                self.decoder_ = CryoFormerStack(
+                    c_z=self.outdim,
+                    c_latent=self.zdim,
+                    c_hidden=self.hidden_dim,
+                    no_heads=4,
+                    no_blocks=layers,
+                    transition_n=2,
+                    dropout_rate=0.15,
+                    blocks_per_ckpt=None
+                )
+                # self.embeddings["pair"].requires_grad = True
+                # self.embeddings["seq_mask"].requires_grad = True
+            else:
+                self.input_proj = Linear(zdim, hidden_dim )
+                self.embedding_proj = Linear(self.outdim, hidden_dim )
+                self.decoder_ = TemplatePairStack(
+                        c_t=hidden_dim,
+                        c_hidden_tri_att= hidden_dim//4,
+                        c_hidden_tri_mul= hidden_dim//2,
+                        no_blocks= layers,
+                        no_heads= 4,
+                        pair_transition_n= layers,
+                        dropout_rate= 0.15,
+                        tri_mul_first=False,
+                        fuse_projection_weights= False,
+                        blocks_per_ckpt =1,
+                        tune_chunk_size=False
+                )
+                self.output_proj = Linear(hidden_dim, self.outdim )
+
+
         else:
             self.decoder_ = ResidLinearMLP(zdim, layers, hidden_dim, self.outdim, activation)
 
@@ -794,33 +811,41 @@ class AFDecoder(torch.nn.Module):
         if self.pair_stack : 
             pos_mask = embedding_expand["seq_mask"]
             pair_mask = pos_mask[..., None] * pos_mask[..., None, :]
+            if self.new:
+                pair_update = self.decoder_(
+                        z=embedding_expand["pair"],
+                        latent=z[..., None, None, :],
+                        mask=pair_mask
+                )
+            else:
 
-            # [B, 1, zdim]
-            pair_update = self.input_proj(z)
+                #[B, 1, zdim]
+                pair_update = self.input_proj(z)
 
-            # [B, N, N, hidden_dim]
-            pair_update = pair_update.unsqueeze(-2).repeat(1, self.res_size **2, 1) 
-            pair_update = pair_update.reshape(batch_dim + (self.res_size, self.res_size, self.hidden_dim))
+                # [B, N, N, hidden_dim]
+                pair_update = pair_update.unsqueeze(-2).repeat(1, self.res_size **2, 1) 
+                pair_update = pair_update.reshape(batch_dim + (self.res_size, self.res_size, self.hidden_dim))
 
-            # [B, N, N, hidden_dim]
-            embedding_update = self.embedding_proj(embedding_expand["pair"])
-            pair_update = add(embedding_update, pair_update, inplace_safe)
+                # [B, N, N, hidden_dim]
+                embedding_update = self.embedding_proj(embedding_expand["pair"])
+                pair_update = add(embedding_update, pair_update, inplace_safe)
 
-            # [B, N, N, hidden_dim]
-            pair_update = self.decoder_(
-                pair_update[..., None, :,:,:],
-                mask=pair_mask[..., None, :,:],
-                chunk_size=self.globals.chunk_size,
-                use_deepspeed_evo_attention=self.globals.use_deepspeed_evo_attention,
-                use_lma=self.globals.use_lma,
-                # use_flash=self.globals.use_flash,
-                inplace_safe=not (self.training or torch.is_grad_enabled()),
-                _mask_trans=self.config._mask_trans,
-            )
+                # [B, N, N, hidden_dim]
+                pair_update = self.decoder_(
+                    pair_update[..., None, :,:,:],
+                    mask=pair_mask[..., None, :,:],
+                    chunk_size=self.globals.chunk_size,
+                    use_deepspeed_evo_attention=self.globals.use_deepspeed_evo_attention,
+                    use_lma=self.globals.use_lma,
+                    # use_flash=self.globals.use_flash,
+                    inplace_safe=not (self.training or torch.is_grad_enabled()),
+                    _mask_trans=self.config._mask_trans,
+                )
 
-            # [B, N, N, outdim]
-            pair_update =self.output_proj(pair_update[..., -1, :, :, :])
-            pair_update = add(embedding_expand["pair"], pair_update, inplace_safe)
+
+                # [B, N, N, outdim]
+                pair_update =self.output_proj(pair_update[..., -1, :, :, :])
+                pair_update = add(embedding_expand["pair"], pair_update, inplace_safe)
 
 
         else:
@@ -1199,3 +1224,239 @@ def get_target_feats(mmcif_file,data_processor):
     for f in ["asym_id","all_atom_positions","all_atom_mask","residue_index","aatype"]:
         merge_feats[f] = np.concatenate([v[f] for k,v in all_chain_features.items()], axis=0)
     return merge_feats
+
+
+
+
+
+
+from openfold.model.primitives import Attention
+from openfold.model.triangular_multiplicative_update import (FusedTriangleMultiplicationOutgoing,FusedTriangleMultiplicationIncoming,
+                                                             TriangleMultiplicationOutgoing,TriangleMultiplicationIncoming)
+from openfold.model.pair_transition import PairTransition
+import torch
+from openfold.model.primitives import Linear, LayerNorm, Attention
+from openfold.utils.chunk_utils import chunk_layer
+from openfold.utils.tensor_utils import (
+    permute_final_dims,
+    flatten_final_dims,
+)
+import torch.nn as nn
+from typing import Optional, List
+from functools import partialmethod, partial
+from openfold.model.dropout import DropoutRowwise, DropoutColumnwise
+from openfold.utils.tensor_utils import add
+from openfold.utils.checkpointing import checkpoint_blocks
+
+class TriangleCrossAttention(nn.Module):
+    def __init__(
+        self, c_q, c_kv, c_hidden, no_heads, inf=1e9
+    ):
+        super(TriangleCrossAttention, self).__init__()
+        self.c_q = c_q
+        self.c_kv = c_kv
+        self.c_hidden = c_hidden
+        self.no_heads = no_heads
+        self.inf = inf
+        self.layer_norm = LayerNorm(self.c_q)
+        # self.linear = Linear(self.c_q, self.no_heads, bias=False, init="normal")
+        self.mha = Attention(
+            self.c_q, self.c_kv, self.c_kv, self.c_hidden, self.no_heads
+        )
+
+    def forward(self, 
+        x: torch.Tensor, 
+        z: torch.Tensor, 
+        mask: Optional[torch.Tensor] = None,
+        chunk_size: Optional[int] = None,
+        inplace_safe: bool = False,
+        **kwargs
+    ) -> torch.Tensor:
+
+        if mask is None:
+            # [*, I, J]
+            mask = x.new_ones(
+                x.shape[:-1],
+            )
+        # [*, I, J, C_in]
+        x = self.layer_norm(x)
+
+        # [*, I, 1, 1, J]
+        mask_bias = (self.inf * (mask - 1))[..., :, None, :, None]
+        biases = [mask_bias]
+        
+        x = self.mha(
+                q_x=x, 
+                kv_x=z, 
+                biases=biases, 
+                **kwargs
+        )
+        return x
+
+
+
+class CryoFormerBlock(nn.Module):
+    def __init__(
+        self,
+        c_z: int,
+        c_latent:int,
+        c_hidden: int,
+        no_heads: int,
+        transition_n: int,
+        dropout_rate: float,
+        inf: float,
+        eps: float
+    ):
+        super(CryoFormerBlock, self).__init__()
+
+        self.tri_att_start = TriangleCrossAttention(
+            c_z,
+            c_latent,
+            c_hidden,
+            no_heads,
+            inf=inf,
+        )
+        self.tri_att_end = TriangleCrossAttention(
+            c_z,
+            c_latent,
+            c_hidden,
+            no_heads,
+            inf=inf,
+        )
+
+        self.pair_transition = PairTransition(
+            c_z,
+            transition_n,
+        )
+        self.ps_dropout_row_layer = DropoutRowwise(dropout_rate)
+
+    def forward(self,
+        z: torch.Tensor,
+        latent:torch.Tensor,
+        pair_mask: torch.Tensor,
+        inplace_safe: bool = False,
+        chunk_size: Optional[int] = None,
+        use_deepspeed_evo_attention: bool = False,
+        use_lma: bool = False,
+        _attn_chunk_size: Optional[int] = None
+    ) -> torch.Tensor:
+        
+        z = add(z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_start(
+                        z,
+                        latent,
+                        mask=pair_mask,
+                        chunk_size=_attn_chunk_size,
+                        use_memory_efficient_kernel=False,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma,
+                        inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=inplace_safe,
+                )
+
+        z = z.transpose(-2, -3)
+        if (inplace_safe):
+            z = z.contiguous()
+
+        z = add(z,
+                self.ps_dropout_row_layer(
+                    self.tri_att_end(
+                        z,
+                        latent,
+                        mask=pair_mask.transpose(-1, -2),
+                        chunk_size=_attn_chunk_size,
+                        use_memory_efficient_kernel=False,
+                        use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                        use_lma=use_lma,
+                        inplace_safe=inplace_safe,
+                    )
+                ),
+                inplace=inplace_safe,
+                )
+
+        z = z.transpose(-2, -3)
+        if (inplace_safe):
+            z = z.contiguous()
+
+        z = add(z,
+                self.pair_transition(
+                    z, mask=None, chunk_size=chunk_size,
+                ),
+                inplace=inplace_safe,
+        )
+
+        return z
+
+class CryoFormerStack(nn.Module):
+    def __init__(
+        self,
+        c_z,
+        c_latent,
+        c_hidden,
+        no_heads,
+        no_blocks,
+        transition_n,
+        dropout_rate,
+        blocks_per_ckpt,
+        inf=1e9,
+        eps = 1e-8,
+    ):
+
+        super(CryoFormerStack, self).__init__()
+
+        self.blocks_per_ckpt = blocks_per_ckpt
+
+        self.blocks = nn.ModuleList()
+        for _ in range(no_blocks):
+            block = CryoFormerBlock(
+                c_z=c_z,
+                c_latent=c_latent,
+                c_hidden=c_hidden,
+                no_heads=no_heads,
+                transition_n=transition_n,
+                dropout_rate=dropout_rate,
+                inf=inf,
+                eps=eps,
+            )
+            self.blocks.append(block)
+
+        self.layer_norm = LayerNorm(c_z)
+
+    def forward(
+        self,
+        z: torch.tensor,
+        latent: torch.tensor,
+        mask: torch.tensor,
+        chunk_size: Optional[int] = None,
+        use_deepspeed_evo_attention: bool = False,
+        use_lma: bool = False,
+        inplace_safe: bool = False,
+    ):
+
+        blocks = [
+            partial(
+                b,
+                latent=latent,
+                pair_mask=mask,
+                chunk_size=chunk_size,
+                use_deepspeed_evo_attention=use_deepspeed_evo_attention,
+                use_lma=use_lma,
+                inplace_safe=inplace_safe,
+            )
+            for b in self.blocks
+        ]
+
+        z, = checkpoint_blocks(
+            blocks=blocks,
+            args=(z,),
+            blocks_per_ckpt=self.blocks_per_ckpt if self.training else None,
+        )
+
+
+        z = self.layer_norm(z)
+
+        return z
+

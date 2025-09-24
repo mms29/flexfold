@@ -561,9 +561,13 @@ def plot_loss(infile, outfile):
             if ("val_" + losses[ii]+"_epoch") in val_epoch:
                 loss = val_epoch["val_" +losses[ii]+"_epoch"]
                 step = val_epoch["epoch"]
-                w = max(len(step)//10,10)
-                ax[x,y].plot(step, loss, alpha=0.5, c=valcol)
-                ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "validation", c=valcol)
+                if len(step)>10:
+                    w = min(len(step)//10,10)
+                    ax[x,y].plot(step, loss, alpha=0.5, c=valcol)
+                    ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "validation", c=valcol)
+                else:
+                    ax[x,y].plot(step, loss, label = "validation", c=valcol)
+
     ax[0,0].legend()
     fig.savefig(outfile, dpi=300)
 
