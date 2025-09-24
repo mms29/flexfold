@@ -782,7 +782,9 @@ class AFDecoder(torch.nn.Module):
         return y_recon, struct
 
     def structure_decoder(self, z):
-        inplace_safe = not (self.training or torch.is_grad_enabled())
+        # inplace_safe = not (self.training or torch.is_grad_enabled())
+        inplace_safe = False #TODO
+
 
         batch_dim = z.shape[:-1]
         embedding_expand = {
@@ -853,7 +855,6 @@ class AFDecoder(torch.nn.Module):
         )
         outputs["final_atom_mask"] = embedding_expand["atom37_atom_exists"]
         outputs["final_affine_tensor"] = outputs["sm"]["frames"][-1]
-
 
         for k, v in embedding_expand.items():
             if k not in outputs : 
@@ -926,10 +927,6 @@ def struct_to_crd(struct, ca=True):
     )
     return crd
 
-
-
-
-#
 class AFDecoderReal(AFDecoder):
     def __init__(self, 
                  **kwargs,

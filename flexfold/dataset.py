@@ -45,7 +45,7 @@ class DataSplits(torch.utils.data.Dataset):
         return self.N
 
     def __getitem__(self, index):
-        return self.imageDataset(self.indices[index])
+        return self.imageDataset[self.indices[index]]
     
     def get_slice(self, start, stop) :
         return (
@@ -170,8 +170,10 @@ class ImageDataset(torch.utils.data.Dataset):
             particles=None
 
         # this is why it is tricky for index to be allowed to be a list!
-        if len(particles.shape) == 2:
-            particles = particles[np.newaxis, ...]
+        if len(particles_real.shape) == 2:
+            particles_real = particles_real[np.newaxis, ...]
+            if particles is not None:
+                particles = particles[np.newaxis, ...]
 
         if isinstance(index, (int, np.integer)):
             logger.debug(f"ImageDataset returning images at index ({index})")

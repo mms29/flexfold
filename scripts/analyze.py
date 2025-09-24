@@ -505,14 +505,42 @@ class VolumeGenerator:
         analysis.gen_volumes(self.weights, self.config, zfile, outdir, **self.vol_args)
 
 
-def loss_plot(infile, oufile, w = 10):
-    
-    movavg = lambda arr: np.convolve(
+def parse_lightning_csv(path):
+    df = pd.read_csv(path)
+
+    # Always keep step + epoch columns if present
+    base_cols = [c for c in ["step", "epoch"] if c in df.columns]
+
+    # Classify metrics
+    step_metrics  = [c for c in df.columns if c.endswith("_step")]
+    epoch_metrics = [c for c in df.columns if c.endswith("_epoch")]
+
+    # Separate val vs train
+    val_step_cols   = [c for c in step_metrics if c.startswith("val")]
+    train_step_cols = [c for c in step_metrics if c not in val_step_cols]
+
+    val_epoch_cols   = [c for c in epoch_metrics if c.startswith("val")]
+    train_epoch_cols = [c for c in epoch_metrics if c not in val_epoch_cols]
+
+    # Build DataFrames (dropping rows where all relevant metrics are NaN)
+    train_step_df  = df[base_cols + train_step_cols].dropna(how="all", subset=train_step_cols).reset_index(drop=True)
+    train_epoch_df = df[base_cols + train_epoch_cols].dropna(how="all", subset=train_epoch_cols).reset_index(drop=True)
+    val_step_df    = df[base_cols + val_step_cols].dropna(how="all", subset=val_step_cols).reset_index(drop=True)
+    val_epoch_df   = df[base_cols + val_epoch_cols].dropna(how="all", subset=val_epoch_cols).reset_index(drop=True)
+
+    return train_step_df, train_epoch_df, val_step_df, val_epoch_df
+
+def plot_loss(infile, outfile):
+    train_step, train_epoch, val_step, val_epoch = parse_lightning_csv(infile)
+
+    movavg = lambda arr,w: np.convolve(
         np.nan_to_num(arr), np.ones(w), 'valid'
     ) / np.convolve(~np.isnan(arr), np.ones(w), 'valid')
+    movavg_step = lambda arr,w: arr[:-(w-1)]*(len(arr)/(len(arr)-w))
 
-    losses=["data_loss_step", "chi_loss_step", "viol_loss_step","center_loss_step", "kld_step", "loss_step"]
+    losses=["data_loss", "chi_loss", "viol_loss","center_loss", "kld", "loss"]
     col = "tab:blue"
+    valcol = "tab:green"
     nrows = 2
     ncols=3
     fig, ax = plt.subplots(nrows,ncols, figsize=(10,5), layout="constrained")
@@ -522,17 +550,24 @@ def loss_plot(infile, oufile, w = 10):
             if ii>=len(losses):
                 break
 
-            metrics =pd.read_csv(infile)
-            ax[x,y].plot(metrics["step"], metrics[losses[ii]], alpha=0.5, c=col)
-            ax[x,y].plot(metrics["step"][:-(w-1)]*(len(metrics["step"])/(len(metrics["step"])-w)), movavg(metrics[losses[ii]]), label = "run", c=col)
-            ax[x,y].set_xlabel("step")
+            loss = train_step[losses[ii]+"_step"]
+            step = train_step["epoch"]
+            w = min(len(step)//10,10)
+            ax[x,y].plot(step, loss, alpha=0.5, c=col)
+            ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "training", c=col)
+            ax[x,y].set_xlabel("epoch")
             ax[x,y].set_ylabel(losses[ii])
-    ax[-1,-1].legend()
-    fig.savefig(oufile, dpi=300)
+
+            if ("val_" + losses[ii]+"_epoch") in val_epoch:
+                loss = val_epoch["val_" +losses[ii]+"_epoch"]
+                step = val_epoch["epoch"]
+                w = max(len(step)//10,10)
+                ax[x,y].plot(step, loss, alpha=0.5, c=valcol)
+                ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "validation", c=valcol)
+    ax[0,0].legend()
+    fig.savefig(outfile, dpi=300)
 
     plt.close(fig)
-
-
 
 def main(args: argparse.Namespace) -> None:
     matplotlib.use("Agg")  # non-interactive backend
@@ -600,7 +635,7 @@ def main(args: argparse.Namespace) -> None:
         os.mkdir(outdir)
 
 
-    loss_plot(f"{workdir}/metrics.csv", f"{outdir}/losses.png")
+    plot_loss(f"{workdir}/metrics.csv", f"{outdir}/losses.png")
 
     z = utils.load_pkl(zfile)
     zdim = z.shape[1]

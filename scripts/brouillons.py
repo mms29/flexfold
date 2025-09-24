@@ -583,3 +583,85 @@ for i in range(n_clusters):
 
     write_mrc(prefix+".mrc", np.array(vol.cpu()).astype(np.float32), Apix=3.0)
 
+
+
+
+
+
+
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import pandas as pd
+
+def parse_lightning_csv(path):
+    df = pd.read_csv(path)
+
+    # Always keep step + epoch columns if present
+    base_cols = [c for c in ["step", "epoch"] if c in df.columns]
+
+    # Classify metrics
+    step_metrics  = [c for c in df.columns if c.endswith("_step")]
+    epoch_metrics = [c for c in df.columns if c.endswith("_epoch")]
+
+    # Separate val vs train
+    val_step_cols   = [c for c in step_metrics if c.startswith("val")]
+    train_step_cols = [c for c in step_metrics if c not in val_step_cols]
+
+    val_epoch_cols   = [c for c in epoch_metrics if c.startswith("val")]
+    train_epoch_cols = [c for c in epoch_metrics if c not in val_epoch_cols]
+
+    # Build DataFrames (dropping rows where all relevant metrics are NaN)
+    train_step_df  = df[base_cols + train_step_cols].dropna(how="all", subset=train_step_cols).reset_index(drop=True)
+    train_epoch_df = df[base_cols + train_epoch_cols].dropna(how="all", subset=train_epoch_cols).reset_index(drop=True)
+    val_step_df    = df[base_cols + val_step_cols].dropna(how="all", subset=val_step_cols).reset_index(drop=True)
+    val_epoch_df   = df[base_cols + val_epoch_cols].dropna(how="all", subset=val_epoch_cols).reset_index(drop=True)
+
+    return train_step_df, train_epoch_df, val_step_df, val_epoch_df
+
+def plot_loss(infile, outfile, w=10):
+    train_step, train_epoch, val_step, val_epoch = parse_lightning_csv(infile)
+
+    movavg = lambda arr: np.convolve(
+        np.nan_to_num(arr), np.ones(w), 'valid'
+    ) / np.convolve(~np.isnan(arr), np.ones(w), 'valid')
+    movavg_step = lambda arr: arr[:-(w-1)]*(len(arr)/(len(arr)-w))
+
+    losses=["data_loss", "chi_loss", "viol_loss","center_loss", "kld", "loss"]
+    col = "tab:blue"
+    valcol = "tab:green"
+    nrows = 2
+    ncols=3
+    fig, ax = plt.subplots(nrows,ncols, figsize=(10,5), layout="constrained")
+    for x in range(nrows):
+        for y in range(ncols):
+            ii = x *ncols + y
+            if ii>=len(losses):
+                break
+
+            loss = train_step[losses[ii]+"_step"]
+            step = train_step["epoch"]
+            ax[x,y].plot(step, loss, alpha=0.5, c=col)
+            ax[x,y].plot(movavg_step(step), movavg(loss), label = "training", c=col)
+            ax[x,y].set_xlabel("epoch")
+            ax[x,y].set_ylabel(losses[ii])
+
+            if ("val" + losses[ii]+"_epoch") in val_epoch:
+                loss = val_epoch["val" +losses[ii]+"_epoch"]
+                step = val_epoch["epoch"]
+                ax[x,y].plot(step, loss, alpha=0.5, c=valcol)
+                ax[x,y].plot(movavg_step(step), movavg(loss), label = "validation", c=valcol)
+    ax[0,0].legend()
+    fig.savefig(outfile, dpi=300)
+
+    plt.close(fig)
+
+# Example usage
+
+
+infile = "/home/vuillemr/cryofold/particlesSNR1.0/run_test/metrics.csv"
+outfile = "/home/vuillemr/cryofold/particlesSNR1.0/run_test/metrics.png"
+w= 10

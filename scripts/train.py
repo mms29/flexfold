@@ -60,7 +60,14 @@ from flexfold.pose import PoseTracker
 from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb,weighted_normalized_l2, gaussian_weight, frequency_weights
 from pytorch_lightning.strategies import DDPStrategy
 from scipy.ndimage import gaussian_filter
-from flexfold.core import ifft2_center
+from flexfold.core import ifft2_center, unsymmetrize_ht
+
+def pad_to_max(tensor, max_size):
+    pad_size = max_size - tensor.size(0)
+    if pad_size > 0:
+        padding = (0, 0) * (tensor.dim() - 1) + (0, pad_size)  # pad last dim only
+        tensor = F.pad(tensor, padding, value=-1)
+    return tensor
 
 def print_model_summary(model):
     total_params = 0
@@ -75,13 +82,13 @@ def print_model_summary(model):
         else:
             frozen_params += n
 
-    print(f"{'='*50}")
-    print(f"Model Summary")
-    print(f"{'='*50}")
-    print(f"Total parameters   : {total_params:,}")
-    print(f"Trainable params   : {trainable_params:,}")
-    print(f"Frozen params      : {frozen_params:,}")
-    print(f"{'='*50}")
+    logger.info(f"{'='*50}")
+    logger.info(f"Model Summary")
+    logger.info(f"{'='*50}")
+    logger.info(f"Total parameters   : {total_params:,}")
+    logger.info(f"Trainable params   : {trainable_params:,}")
+    logger.info(f"Frozen params      : {frozen_params:,}")
+    logger.info(f"{'='*50}")
 
 logger = logging.getLogger(__name__)
 
@@ -579,8 +586,6 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         # load model ------------------------------------------------------------------------------------------------------------------------
 
-        print("HHHHHHHHHELLOOOOO")
-
         self.model = HetOnlyVAE(
             self.lattice,
             args.qlayers,
@@ -610,6 +615,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         self.val_z_mu = []
         self.val_z_logvar = []
+        self.val_z_idx = []
 
         if self.args.frozen_structure_module:
             for param in self.model.decoder.structure_module.parameters():
@@ -634,7 +640,7 @@ class LitHetOnlyVAE(pl.LightningModule):
             return optimizer
         
     def prepare_batch(self, batch):
-        ind = batch[-1]
+        particles, particles_real, ind = batch
         B = ind.size(0)
         D = self.lattice.D
 
@@ -642,15 +648,15 @@ class LitHetOnlyVAE(pl.LightningModule):
         rot, tran = self.posetracker.get_pose(ind)
 
         # Image
-        y_real = self.lattice.translate_real(batch[1], tran.unsqueeze(1)).view(B, D-1, D-1)
+        y_real = self.lattice.translate_real(particles_real, tran.unsqueeze(1)).view(B, D-1, D-1)
         y_real = y_real.transpose(-1,-2)
 
         if self.domain == "fourier":
-            y = torch.view_as_real(batch[2])
+            y = torch.view_as_real(particles)
             y = self.lattice.translate_ft(y.view(B, D*D, 2), tran.unsqueeze(1)).view(B, D, D, 2)
             # y_real = ifft2_center(torch.view_as_complex(y)).real
         elif self.domain == "hartley":
-            y = batch[0]
+            y = particles
             y = self.lattice.translate_ht(y.view(B, -1), tran.unsqueeze(1)).view(B, D, D)
             # y_real = fft.iht2_center(y)
         elif self.domain == "real":
@@ -678,7 +684,7 @@ class LitHetOnlyVAE(pl.LightningModule):
         y_recon : [B, D, D] FT complex
         y_recon_real :[B, D-1, D-1] Real
         """
-        print("Writing debug PNG at iteration %i"%global_it)
+        logger.info("Writing debug PNG at iteration %i"%global_it)
         D = self.lattice.D
         B=y_real.size(0)
         if B> 8 : 
@@ -770,7 +776,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         # Real space
         y_recon_real = y_recon.reshape(B, D,D)
-        y_recon_real = fft.unsymmetrize_ht(y_recon_real)
+        y_recon_real = unsymmetrize_ht(y_recon_real)
         y_recon_real = ifft2_center(y_recon_real).real
 
         return y_recon, y_recon_real, mask, struct
@@ -811,66 +817,82 @@ class LitHetOnlyVAE(pl.LightningModule):
         )
 
         # Logging
-        self.log("loss", loss, prog_bar=True, sync_dist=True, on_epoch=True, on_step=True)
-        self.log("kld", kld, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True)
+        self.log("loss", loss, prog_bar=True, sync_dist=False, on_epoch=True, on_step=True)
+        self.log("kld", kld, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
         for k,v in gen_loss.items():
-            self.log(k, v, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True)
+            self.log(k, v, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
 
         return loss
 
 
-    def validation_step(self, batch, batch_idx):
-        y, _, _, _, c = self.prepare_batch(batch)
+    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+        idx = batch[-1]
+        y, y_real, rot, _, c = self.prepare_batch(batch)
         z_mu, z_logvar = self.run_encoder(y, c)
+
         self.val_z_mu.append(z_mu)
         self.val_z_logvar.append(z_logvar)
-    
+        self.val_z_idx.append(idx)
+
+        if dataloader_idx == 0 :
+                _,y_recon_real, _, struct = self.run_decoder(z_mu,rot, c)
+                gen_loss, total_gen_loss = self.gen_loss(y_real, y_recon_real, struct)
+
+                self.log("val_loss", total_gen_loss, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True, add_dataloader_idx=False)
+                for k,v in gen_loss.items():
+                    self.log("val_" + k, v, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True, add_dataloader_idx=False)
+
+
+
     def on_validation_epoch_end(self):
+
+        # Stack tensors from local GPU
+        z_mu = torch.cat(self.val_z_mu, dim=0)
+        z_logvar = torch.cat(self.val_z_logvar, dim=0)
+        z_idx = torch.cat(self.val_z_idx, dim=0)
+
+        batch_size = torch.tensor(z_mu.size(0), device=z_mu.device)
+        max_size = self.all_gather(batch_size).max()
+
+        z_mu = pad_to_max(z_mu, max_size)
+        z_logvar = pad_to_max(z_logvar, max_size)
+        z_idx = pad_to_max(z_idx, max_size)
+
+        # Gather across all GPUs
+        z_mu = self.all_gather(z_mu)
+        z_logvar = self.all_gather(z_logvar)
+        z_idx = self.all_gather(z_idx)
+
+        # Remove padded entries (idx == -1)
+        valid_mask = z_idx != -1
+        z_mu = z_mu[valid_mask]
+        z_logvar = z_logvar[valid_mask]
+        z_idx = z_idx[valid_mask]
+
+        # Reorder by idx
+        def get_first_idx(A):
+            unique, idx, counts = torch.unique(A, sorted=True, return_inverse=True, return_counts=True)
+            _, ind_sorted = torch.sort(idx, stable=True)
+            cum_sum = counts.cumsum(0)
+            cum_sum = torch.cat((torch.tensor([0], device=A.device), cum_sum[:-1]))
+            return ind_sorted[cum_sum]
+        sorted_idx = get_first_idx(z_idx)
+        z_mu = z_mu[sorted_idx]
+        z_logvar = z_logvar[sorted_idx]
+        z_idx = z_idx[sorted_idx]
+
+        assert  torch.all(z_idx[1:]>z_idx[:-1]), "not continuous!"
+
+        self.val_z_mu.clear()
+        self.val_z_logvar.clear() 
+        self.val_z_idx.clear() 
+
         if self.trainer.is_global_zero: 
-            
-            z_mu_all = torch.cat(self.val_z_mu).to(torch.float32).detach().cpu().numpy()
-            z_logvar_all = torch.cat(self.val_z_logvar).to(torch.float32).detach().cpu().numpy()
-
-
-            out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
             out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
+            out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
+            save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu.detach().cpu().numpy(), z_logvar.detach().cpu().numpy(), out_weights, out_z)
 
-            
-            save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu_all, z_logvar_all, out_weights, out_z)
-            self.val_z_mu.clear()
-            self.val_z_logvar.clear() 
-
-    # def on_validation_epoch_end(self):
-
-    #     z_mu_local = torch.cat(self.val_z_mu, dim=0).detach().cpu().numpy()
-    #     z_logvar_local = torch.cat(self.val_z_logvar, dim=0).detach().cpu().numpy()
-
-    #     world_size = torch.distributed.get_world_size()
-    #     gathered_mu, gathered_logvar = [None]*world_size, [None]*world_size
-
-    #     torch.distributed.all_gather_object(gathered_mu, z_mu_local)
-    #     torch.distributed.all_gather_object(gathered_logvar, z_logvar_local)
-
-    #     if torch.distributed.get_rank() == 0:
-    #         z_mu_all = np.concatenate(gathered_mu, axis=0)
-    #         z_logvar_all = np.concatenate(gathered_logvar, axis=0)
-    #         out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
-    #         out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
-            
-    #         save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu_all, z_logvar_all, out_weights, out_z)
-    
-
-    def loss_function(
-            self,
-            z_mu,
-            z_logvar,
-            y,
-            y_recon,
-            mask,
-            beta,
-            struct,
-        ):
-
+    def gen_loss(self, y, y_recon, struct):
         # Reconstruction loss
         data_loss = torch.mean(1-get_cc(y, y_recon))
 
@@ -911,6 +933,21 @@ class LitHetOnlyVAE(pl.LightningModule):
             viol_loss * self.args.viol_loss_weight +
             center_loss * self.args.center_loss_weight
         )
+        return gen_loss, total_gen_loss
+
+    def loss_function(
+            self,
+            z_mu,
+            z_logvar,
+            y,
+            y_recon,
+            mask,
+            beta,
+            struct,
+        ):
+
+        # total of data loss and structural contraints
+        gen_loss, total_gen_loss = self.gen_loss(y, y_recon, struct)
 
         # latent loss
         kld = torch.mean(
@@ -929,7 +966,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         return loss, gen_loss, kld
 
-def save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z):
+def save_checkpoint(model, optim, epoch, z_mu,z_logvar, out_weights, out_z):
     """Save model weights, latent encoding z, and decoder volumes"""
     # save model weights
     torch.save(
@@ -940,11 +977,15 @@ def save_checkpoint(model, optim, epoch, z_mu, z_logvar, out_weights, out_z):
         },
         out_weights,
     )
-    # save z
     with open(out_z, "wb") as f:
         pickle.dump(z_mu, f)
         pickle.dump(z_logvar, f)
 
+def load_z(out_z):
+    with open(out_z, "rb") as f:
+        z_mu = pickle.load(f)
+        z_logvar = pickle.load(f)
+    return z_mu, z_logvar
 
 class LitDataModule(pl.LightningDataModule):
     def __init__(self, args):
@@ -979,7 +1020,14 @@ class LitDataModule(pl.LightningDataModule):
         self.train_data = dataset.DataSplits(imageDataset, indices_train)
         self.val_data  = dataset.DataSplits(imageDataset, indices_val)
 
-
+        logger.info(f"{'='*50}")
+        logger.info(f"Data Summary")
+        logger.info(f"{'='*50}")
+        total = self.train_data.N + self.val_data.N 
+        logger.info("TOTAL PARTICLES       : %i"%(total))
+        logger.info("training particles    : %i (%.2f %%)"%(self.train_data.N, 100* self.train_data.N /total))
+        logger.info("validation particles  : %i (%.2f %%) "%(self.val_data.N, 100*  self.val_data.N /total ))
+        logger.info(f"{'='*50}")
 
     def train_dataloader(self):
         args = self.args
@@ -1013,7 +1061,6 @@ class LitDataModule(pl.LightningDataModule):
         ]
     
 def main(args: argparse.Namespace) -> None:
-
     if args.verbose:
         logger.setLevel(logging.DEBUG)
     torch.autograd.set_detect_anomaly(True)
@@ -1041,7 +1088,7 @@ def main(args: argparse.Namespace) -> None:
     datamodule.setup()
 
     # load model ------------------------------------------------------------------------------------------------------------------------
-    model = LitHetOnlyVAE(args, datamodule.train_data.D, datamodule.train_data.N)
+    model = LitHetOnlyVAE(args, datamodule.train_data.D, datamodule.train_data.N + datamodule.val_data.N)
 
     if args.load:
         logger.info("Loading checkpoint from {}".format(args.load))
@@ -1070,7 +1117,7 @@ def main(args: argparse.Namespace) -> None:
 
     # save configuration
     out_config = "{}/config.yaml".format(args.outdir)
-    save_config(args, datamodule.train_data, model.model.lattice, out_config)
+    save_config(args, datamodule.train_data.imageDataset, model.model.lattice, out_config)
 
     # checkpoint_callback = pl.callbacks.ModelCheckpoint(
     #     dirpath=args.outdir,          # where to save
