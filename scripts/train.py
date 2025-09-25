@@ -61,6 +61,7 @@ from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, str
 from pytorch_lightning.strategies import DDPStrategy
 from scipy.ndimage import gaussian_filter
 from flexfold.core import ifft2_center, unsymmetrize_ht
+from torch.optim.lr_scheduler import LambdaLR
 
 def pad_to_max(tensor, max_size):
     pad_size = max_size - tensor.size(0)
@@ -336,6 +337,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=1e-4,
         help="Learning rate in Adam optimizer (default: %(default)s)",
+    )
+    group.add_argument(
+        "--warmup",
+        type=int,
+        default=10,
+        help="TODO",
     )
     group.add_argument(
         "--beta",
@@ -629,15 +636,28 @@ class LitHetOnlyVAE(pl.LightningModule):
         print_model_summary(self.model)
 
     def configure_optimizers(self):
+
         optimizer = torch.optim.Adam(
             self.parameters(), lr=self.args.lr,  weight_decay=self.args.wd
         )
+        
+        def lr_lambda(step):
+            if step < self.args.warmup:
+                return float(step) / float(max(1, self.args.warmup))
+            return 1.0  # keep LR constant after warmup
+        
+        scheduler = {
+            'scheduler': LambdaLR(optimizer, lr_lambda),
+            'interval': 'step',  # call every step
+            'frequency': 1
+        }
+
         if self.args.do_pose_sgd : 
             pose_optimizer = torch.optim.SparseAdam(list(self.posetracker.parameters()), lr=self.args.pose_lr)
-            return [optimizer, pose_optimizer]
+            return [optimizer, pose_optimizer], [scheduler]
         
         else:
-            return optimizer
+            return [optimizer], [scheduler]
         
     def prepare_batch(self, batch):
         particles, particles_real, ind = batch
