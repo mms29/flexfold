@@ -552,16 +552,20 @@ def plot_loss(infile, outfile):
 
             loss = train_step[losses[ii]+"_step"]
             step = train_step["epoch"]
-            w = min(len(step)//10,10)
-            ax[x,y].plot(step, loss, alpha=0.5, c=col)
-            ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "training", c=col)
+            if len(step)>50:
+                w = min(len(step)//10,10)
+                ax[x,y].plot(step, loss, alpha=0.5, c=col)
+                ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "training", c=col)
+            else:
+                ax[x,y].plot(step, loss, label = "training", c=col)
+
             ax[x,y].set_xlabel("epoch")
             ax[x,y].set_ylabel(losses[ii])
 
             if ("val_" + losses[ii]+"_epoch") in val_epoch:
                 loss = val_epoch["val_" +losses[ii]+"_epoch"]
                 step = val_epoch["epoch"]
-                if len(step)>10:
+                if len(step)>50:
                     w = min(len(step)//10,10)
                     ax[x,y].plot(step, loss, alpha=0.5, c=valcol)
                     ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "validation", c=valcol)
