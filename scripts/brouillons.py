@@ -992,4 +992,4 @@ vol2,_ = parse_mrc("data/cryofold/particlesSNR1.0/bench_conv/analysis/pc1/vol_00
 
 fsc = get_fsc_curve(torch.tensor(vol1)[:-1,:-1,:-1], torch.tensor(vol2)[:-1,:-1,:-1])
 
-get_fsc_thresholds(fsc, apix=2.2)
+fsc_res = get_fsc_thresholds(fsc, apix=2.2)
