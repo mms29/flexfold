@@ -59,6 +59,14 @@ def struct_to_pdb(struct, file):
     with open(file, 'w') as fp:
         fp.write(outstring)
 
+def rotmat_angle_deg(Ra, Rb):
+    # Ra, Rb: (..., 3, 3) rotation matrices (torch tensors)
+    R = Ra.transpose(-2, -1).matmul(Rb)          # relative rotation
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    cos_theta = (tr - 1.0) / 2.0
+    cos_theta = cos_theta.clamp(-1.0, 1.0)
+    theta = torch.acos(cos_theta)               # radians in [0, pi]
+    return theta * (180.0 / torch.pi)
 
 def ifft2_center(img: torch.Tensor) -> torch.Tensor:
     """2-dimensional discrete inverse Fourier transform reordered with origin at center."""

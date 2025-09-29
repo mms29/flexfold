@@ -480,6 +480,39 @@ python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdb
 
 #*DIRECT REAL *****************************************************
 BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/run_test
+python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 2.2 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
+    --initial_pose_path $BASE_DIR/initial_pose.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --batch-size 16  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 32 \
+    --enc-layers 4 \
+    --dec-dim 32 \
+    --dec-layers 4 \
+    --domain real \
+    --encode-mode conv \
+    --overwrite\
+    --all_atom \
+    --pair_stack\
+    --frozen_structure_module\
+    --wd 1e-4\
+    --lr 5e-4\
+    --warmup 100\
+    --devices 1 
+
+
+#*DIRECT REAL *****************************************************
+BASE_DIR="../cryofold/particlesSNR1.0"
 RUN_DIR=$BASE_DIR/bench_cryofomer_optim_large
 python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
     --poses $BASE_DIR/particles.pkl \
@@ -508,6 +541,35 @@ python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
     --wd 1e-4\
     --lr 5e-4\
     --warmup 100\
+    #*DIRECT REAL *****************************************************
+BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/bench_cryofomer_base
+python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --pixel_size 2.2 \
+    --sigma 1.05 \
+    --quality_ratio 5.0 \
+    --embedding_path ../cryofold/embeddings/4ake_A_embeddings.pt \
+    --initial_pose_path $BASE_DIR/initial_pose.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/openfold_params/finetuning_no_templ_1.pt \
+    --batch-size 64  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 128 \
+    --enc-layers 3 \
+    --dec-dim 128 \
+    --dec-layers 3 \
+    --domain hartley \
+    --overwrite\
+    --all_atom \
+    --wd 1e-4\
+    --lr 5e-4\
+    --warmup 100\
+    --devices 1
     
+
 python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
 python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt

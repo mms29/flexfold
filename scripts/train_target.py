@@ -44,7 +44,8 @@ from pytorch_lightning.strategies import DDPStrategy
 from openfold.utils.loss import fape_loss, compute_renamed_ground_truth
 from torch.utils.data import Dataset, DataLoader
 
-from scripts.train import LitHetOnlyVAE, save_checkpoint, save_config, add_args
+from scripts.train import LitDataModule,LitHetOnlyVAE, save_checkpoint, save_config, add_args
+from pytorch_lightning.plugins.environments import MPIEnvironment
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,19 @@ logger = logging.getLogger(__name__)
 class LitTarget(LitHetOnlyVAE):
     
     def training_step(self, batch):
+
+        # Get optimizers
+        if args.do_pose_sgd:
+            optimizer, _ = self.optimizers()
+        else:
+            optimizer = self.optimizers()
+
+        # Set gradients to zero
+        optimizer.zero_grad()
+
+        # Get scheduler
+        sch = self.lr_schedulers() 
+
         z_mu = torch.zeros(self.model.decoder.zdim, device=self.device)[None]
         z_logvar = torch.ones(self.model.decoder.zdim, device=self.device)[None]
         z = self.model.reparameterize(z_mu, z_logvar)
@@ -71,24 +85,32 @@ class LitTarget(LitHetOnlyVAE):
             batch = struct,
             config = self.model.decoder.loss_config.fape)
         
-        if self.current_epoch%100 == 0:
+        # Backward pass
+        self.manual_backward(loss)
 
-            out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
-            out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
-            out_pdb = "{}/fit.{}.pdb".format(self.args.outdir, self.current_epoch)
+        # Optimizer step
+        optimizer.step()
 
-            
-            save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu, z_logvar, out_weights, out_z)
-            struct_to_pdb(tensor_tree_map(lambda x: (x.float() if x.dtype==torch.bfloat16 else x).detach().cpu().numpy()[-1], struct), out_pdb)
+        # Scheduler step
+        sch.step()
+        
+        if self.global_step %25 == 0:
+            if self.trainer.is_global_zero:
+                logger.info("Writing checkpoint at step %s ..."%self.global_step)
+                out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
+                out_z = "{}/z.{}.pkl".format(self.args.outdir, self.current_epoch)
+                out_pdb = "{}/fit.{}.pdb".format(self.args.outdir, self.current_epoch)
 
-        return loss
+                
+                save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu, z_logvar, out_weights, out_z)
+                struct_to_pdb(tensor_tree_map(lambda x: (x.float() if x.dtype==torch.bfloat16 else x).detach().cpu().numpy()[-1], struct), out_pdb)
 
 class DummyDataset(Dataset):
     def __init__(self):
         super().__init__()
 
     def __len__(self):
-        return 1  # Only one element total
+        return 100  # Only one element total
 
     def __getitem__(self, idx):
         return torch.empty(0)
@@ -119,25 +141,40 @@ def main(args: argparse.Namespace) -> None:
 
     # load dataset ------------------------------------------------------------------------------------------------------------------------
     logger.info(f"Loading dataset")
-    datamodule = DummyDataModule(args)
+    dummydatamodule = DummyDataModule(args)
+    dummydatamodule.setup()
+    datamodule = LitDataModule(args)
     datamodule.setup()
-
     # load model ------------------------------------------------------------------------------------------------------------------------
-    model = LitTarget(args, 128 + 1, 100000)
+    model = LitTarget(args, datamodule.imageDataset.D, datamodule.imageDataset.N)
+
+    cluster_environment = MPIEnvironment() if args.mpi_plugin else None
+
+    n_devices = torch.cuda.device_count() if args.devices == "auto" else int(args.devices)
+
+    if n_devices >1:
+        strategy = DDPStrategy(find_unused_parameters=True,
+                               static_graph=True,
+                                cluster_environment=cluster_environment,
+                                process_group_backend="nccl")
+                                # process_group_backend="gloo")
+    else:
+        strategy="auto"
+
 
     trainer = pl.Trainer(
         max_epochs=args.num_epochs,
         accelerator="auto",
-        strategy="auto",
+        strategy=strategy,
         # strategy=DDPStrategy(),
-        devices=1,                 # or >1 for multi-GPU
+        devices=args.devices,                 # or >1 for multi-GPU
         precision=args.precision,  # AMP support
         log_every_n_steps=10,
         callbacks=None,           # optional callbacks like ModelCheckpoint
         logger=CSVLogger(args.outdir, name="", version="")
     )
 
-    trainer.fit(model, datamodule=datamodule, ckpt_path=args.load)
+    trainer.fit(model, datamodule=dummydatamodule, ckpt_path=args.load)
 
 
 

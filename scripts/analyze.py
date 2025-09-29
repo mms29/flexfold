@@ -538,7 +538,7 @@ def plot_loss(infile, outfile):
     ) / np.convolve(~np.isnan(arr), np.ones(w), 'valid')
     movavg_step = lambda arr,w: arr[:-(w-1)]*(len(arr)/(len(arr)-w))
 
-    losses=["data_loss", "chi_loss", "viol_loss","center_loss", "kld", "loss"]
+    losses=["data_loss", "chi_loss", "viol_loss","pose_rot", "kld", "loss"]
     col = "tab:blue"
     valcol = "tab:green"
     nrows = 2
@@ -550,8 +550,11 @@ def plot_loss(infile, outfile):
             if ii>=len(losses):
                 break
 
+            if not losses[ii]+"_step" in train_step:
+                break
+
             loss = train_step[losses[ii]+"_step"]
-            step = train_step["epoch"]
+            step = train_step["step"] * (train_step["epoch"].max() - train_step["epoch"].min()) / (train_step["step"].max() - train_step["step"].min())
             if len(step)>50:
                 w = min(len(step)//10,10)
                 ax[x,y].plot(step, loss, alpha=0.5, c=col)
@@ -643,7 +646,7 @@ def main(args: argparse.Namespace) -> None:
         os.mkdir(outdir)
 
 
-    plot_loss(f"{workdir}/metrics.csv", f"{outdir}/losses.png")
+    plot_loss(f"{workdir}/metrics.csv", f"{outdir}/losses.svg")
 
     z = utils.load_pkl(zfile)
     zdim = z.shape[1]

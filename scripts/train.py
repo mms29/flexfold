@@ -60,7 +60,7 @@ from flexfold.pose import PoseTracker
 from flexfold.core import vol_real, get_cc, fourier_corr, output_single_pdb, struct_to_pdb,weighted_normalized_l2, gaussian_weight, frequency_weights
 from pytorch_lightning.strategies import DDPStrategy
 from scipy.ndimage import gaussian_filter
-from flexfold.core import ifft2_center, unsymmetrize_ht
+from flexfold.core import ifft2_center, unsymmetrize_ht, rotmat_angle_deg
 from torch.optim.lr_scheduler import LambdaLR
 
 def pad_to_max(tensor, max_size):
@@ -74,9 +74,19 @@ def print_model_summary(model):
     total_params = 0
     trainable_params = 0
     frozen_params = 0
+    decoder_param = 0
+    encoder_param = 0
+
+    detail = {}
+
+    for name, p in model.model.decoder.named_parameters():
+        decoder_param+=p.numel()
+    for name, p in model.model.encoder.named_parameters():
+        encoder_param+=p.numel()
 
     for name, p in model.named_parameters():
         n = p.numel()
+        detail[name] = n
         total_params += n
         if p.requires_grad:
             trainable_params += n
@@ -89,7 +99,20 @@ def print_model_summary(model):
     logger.info(f"Total parameters   : {total_params:,}")
     logger.info(f"Trainable params   : {trainable_params:,}")
     logger.info(f"Frozen params      : {frozen_params:,}")
+    logger.info(f"Decoder params      : {decoder_param:,}")
+    logger.info(f"Encoder params      : {encoder_param:,}")
     logger.info(f"{'='*50}")
+
+    for k,v in detail.items():
+        logger.info("%s \t\t-> %.2f"%(k,v/1e6))
+
+    print("PARAMS-----------")
+    for name, p in model.posetracker.named_parameters():
+        print(name)
+    print("PARAMS-----------")
+    for name, p in model.model.named_parameters():
+        print(name)
+
 
 logger = logging.getLogger(__name__)
 
@@ -560,13 +583,13 @@ class LitHetOnlyVAE(pl.LightningModule):
         activation = {"relu": nn.ReLU, "leaky_relu": nn.LeakyReLU}[args.activation]
 
         # load poses ------------------------------------------------------------------------------------------------------------------------
-        if args.do_pose_sgd:
-            assert (
-                args.domain == "hartley"
-            ), "Need to use --domain hartley if doing pose SGD"
+        # if args.do_pose_sgd:
+        #     assert (
+        #         args.domain == "hartley"
+        #     ), "Need to use --domain hartley if doing pose SGD"
         do_pose_sgd = args.do_pose_sgd
         self.posetracker = PoseTracker.load(
-            args.poses, Nparticles, D, "s2s2" if do_pose_sgd else None, args.ind,
+            args.poses, Nparticles, D, args.emb_type if do_pose_sgd else None, args.ind,
         )
 
         # load ctf ------------------------------------------------------------------------------------------------------------------------
@@ -633,12 +656,14 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         self.model.decoder.globals.use_lma = args.use_lma
 
-        print_model_summary(self.model)
+        self.automatic_optimization = False
+
+        print_model_summary(self)
 
     def configure_optimizers(self):
 
         optimizer = torch.optim.Adam(
-            self.parameters(), lr=self.args.lr,  weight_decay=self.args.wd
+            self.model.parameters(), lr=self.args.lr,  weight_decay=self.args.wd
         )
         
         def lr_lambda(step):
@@ -653,7 +678,7 @@ class LitHetOnlyVAE(pl.LightningModule):
         }
 
         if self.args.do_pose_sgd : 
-            pose_optimizer = torch.optim.SparseAdam(list(self.posetracker.parameters()), lr=self.args.pose_lr)
+            pose_optimizer = torch.optim.SparseAdam(self.posetracker.parameters(), lr=self.args.pose_lr)
             return [optimizer, pose_optimizer], [scheduler]
         
         else:
@@ -672,12 +697,10 @@ class LitHetOnlyVAE(pl.LightningModule):
         y_real = y_real.transpose(-1,-2)
 
         if self.domain == "fourier":
-            y = torch.view_as_real(particles)
-            y = self.lattice.translate_ft(y.view(B, D*D, 2), tran.unsqueeze(1)).view(B, D, D, 2)
+            y = self.lattice.translate_ft(torch.view_as_real(particles).view(B, D*D, 2), tran.unsqueeze(1)).view(B, D, D, 2)
             # y_real = ifft2_center(torch.view_as_complex(y)).real
         elif self.domain == "hartley":
-            y = particles
-            y = self.lattice.translate_ht(y.view(B, -1), tran.unsqueeze(1)).view(B, D, D)
+            y = self.lattice.translate_ht(particles.view(B, -1), tran.unsqueeze(1)).view(B, D, D)
             # y_real = fft.iht2_center(y)
         elif self.domain == "real":
             y=y_real.contiguous()
@@ -804,13 +827,25 @@ class LitHetOnlyVAE(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
 
-       
-        # Preprocessing
-        y, y_real, rot, _, c = self.prepare_batch(batch)
+        # Get optimizers
+        if args.do_pose_sgd:
+            optimizer, pose_optimizer = self.optimizers()
+        else:
+            optimizer = self.optimizers()
 
+        # Set gradients to zero
+        optimizer.zero_grad()
+        if args.do_pose_sgd:
+            pose_optimizer.zero_grad()
+
+        # Get scheduler
+        sch = self.lr_schedulers() 
+
+        # Preprocessing
         B = batch[-1].size(0)
         global_it = self.Nparticles * self.current_epoch +  batch_idx * B
         beta = self.beta_schedule( global_it)
+        y, y_real, rot, tran, c = self.prepare_batch(batch)
 
         # Encdoer
         z_mu, z_logvar = self.run_encoder(y, c)
@@ -836,24 +871,42 @@ class LitHetOnlyVAE(pl.LightningModule):
             struct=struct
         )
 
+        # Backward pass
+        self.manual_backward(loss)
+
+        # Optimizer step
+        optimizer.step()
+        if args.do_pose_sgd:
+            if self.current_epoch >= self.args.pretrain :
+                pose_optimizer.step()
+
+
+        # Scheduler step
+        sch.step()
+        
         # Logging
         self.log("loss", loss, prog_bar=True, sync_dist=False, on_epoch=True, on_step=True)
         self.log("kld", kld, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
         for k,v in gen_loss.items():
             self.log(k, v, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
 
-        return loss
-    
-    def on_after_backward(self):
-        unused = []
-        for name, param in self.named_parameters():
-            if param.requires_grad and param.grad is None:
-                unused.append(name)
-        if unused:
-            print("⚠️ Unused parameters detected:")
-            for u in unused:
-                print(u)
-            print()
+        if args.do_pose_sgd:
+            rot_init, tran_init = self.posetracker.get_pose_init(batch[-1])
+            pose_tran = torch.norm((tran_init-tran), dim=-1).mean()
+            pose_rot = rotmat_angle_deg(rot, rot_init).mean()
+            self.log("pose_tran", pose_tran, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
+            self.log("pose_rot", pose_rot, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
+            
+    # def on_after_backward(self):
+    #     unused = []
+    #     for name, param in self.named_parameters():
+    #         if param.requires_grad and param.grad is None:
+    #             unused.append(name)
+    #     if unused:
+    #         print("⚠️ Unused parameters detected:")
+    #         for u in unused:
+    #             print(u)
+    #         print()
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         idx = batch[-1]
@@ -999,6 +1052,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 def save_checkpoint(model, optim, epoch, z_mu,z_logvar, out_weights, out_z):
     """Save model weights, latent encoding z, and decoder volumes"""
     # save model weights
+    optim = optim[0] if isinstance(optim, (list, tuple)) else optim
     torch.save(
         {
             "epoch": epoch,
@@ -1030,7 +1084,7 @@ class LitDataModule(pl.LightningDataModule):
         else:
             ind = None
 
-        imageDataset = dataset.ImageDataset(
+        self.imageDataset = dataset.ImageDataset(
             mrcfile=args.particles,
             lazy=args.lazy,
             norm=args.norm,
@@ -1040,15 +1094,16 @@ class LitDataModule(pl.LightningDataModule):
             datadir=args.datadir,
             window_r=args.window_r,
             max_threads=args.max_threads,
+            domain=args.domain,
         )
 
-        indices = np.arange(imageDataset.N)
-        first_val_ind = int(self.args.train_val_ratio * imageDataset.N)
+        indices = np.arange(self.imageDataset.N)
+        first_val_ind = int(self.args.train_val_ratio * self.imageDataset.N)
         indices_train = indices[:first_val_ind]
         indices_val = indices[first_val_ind:]
 
-        self.train_data = dataset.DataSplits(imageDataset, indices_train)
-        self.val_data  = dataset.DataSplits(imageDataset, indices_val)
+        self.train_data = dataset.DataSplits(self.imageDataset, indices_train)
+        self.val_data  = dataset.DataSplits(self.imageDataset, indices_val)
 
         logger.info(f"{'='*50}")
         logger.info(f"Data Summary")
@@ -1118,7 +1173,7 @@ def main(args: argparse.Namespace) -> None:
     datamodule.setup()
 
     # load model ------------------------------------------------------------------------------------------------------------------------
-    model = LitHetOnlyVAE(args, datamodule.train_data.D, datamodule.train_data.N + datamodule.val_data.N)
+    model = LitHetOnlyVAE(args, datamodule.imageDataset.D, datamodule.imageDataset.N)
 
     if args.load:
         logger.info("Loading checkpoint from {}".format(args.load))

@@ -28,15 +28,22 @@ python -u ./scripts/train_target.py \
     --batch-size 1  \
     --num-workers 0 \
     --zdim 4  \
-    --enc-dim 64 \
+    --enc-dim 32 \
     --enc-layers 5 \
-    --dec-dim 128 \
-    --dec-layers 3 \
+    --dec-dim 32 \
+    --dec-layers 4 \
     --domain real \
     --encode-mode conv \
-    --use_lma \
     --pair_stack \
-    --frozen_structure_module \
     --target_file ~/cryofold/cryobench_IgD/1HZH.cif \
     --overwrite \
-    --multimer 
+    --multimer \
+      --wd 1e-4\
+    --lr 5e-4\
+    --warmup 20 \
+#     --use_lma \
+
+
+python ./scripts/compute_initial_pose.py $BASE_DIR/initial_pose_conv \
+ --from_aligned_pdb data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/aligned_target_conv.pdb \
+ --alignment_reference data//cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run_target_conv/fit.37.pdb  --overwrite

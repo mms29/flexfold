@@ -168,3 +168,9 @@ class PoseTracker(nn.Module):
             tran = self.trans_emb(ind) if self.trans_emb is not None else None
 
         return rot, tran
+
+
+    def get_pose_init(self, ind: Union[int, Tensor]) -> Tuple[Tensor, Optional[Tensor]]:
+        rot = self.rots[ind]
+        tran = self.trans[ind] if self.trans is not None else None
+        return rot, tran

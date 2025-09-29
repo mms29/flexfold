@@ -620,55 +620,72 @@ def parse_lightning_csv(path):
     val_step_df    = df[base_cols + val_step_cols].dropna(how="all", subset=val_step_cols).reset_index(drop=True)
     val_epoch_df   = df[base_cols + val_epoch_cols].dropna(how="all", subset=val_epoch_cols).reset_index(drop=True)
 
+    def get_epoch_smooth():
+        epoch_float = []
+        for e, group in df.groupby("epoch"):
+            steps = group["step"].values
+            steps_per_epoch = steps.max() - steps.min() + 1
+            epoch_frac = e + (steps - steps.min()) / steps_per_epoch
+            epoch_float.extend(epoch_frac)
+
     return train_step_df, train_epoch_df, val_step_df, val_epoch_df
 
-def plot_loss(infile, outfile, w=10):
-    train_step, train_epoch, val_step, val_epoch = parse_lightning_csv(infile)
-
-    movavg = lambda arr: np.convolve(
-        np.nan_to_num(arr), np.ones(w), 'valid'
-    ) / np.convolve(~np.isnan(arr), np.ones(w), 'valid')
-    movavg_step = lambda arr: arr[:-(w-1)]*(len(arr)/(len(arr)-w))
-
-    losses=["data_loss", "chi_loss", "viol_loss","center_loss", "kld", "loss"]
-    col = "tab:blue"
-    valcol = "tab:green"
-    nrows = 2
-    ncols=3
-    fig, ax = plt.subplots(nrows,ncols, figsize=(10,5), layout="constrained")
-    for x in range(nrows):
-        for y in range(ncols):
-            ii = x *ncols + y
-            if ii>=len(losses):
-                break
-
-            loss = train_step[losses[ii]+"_step"]
-            step = train_step["epoch"]
-            ax[x,y].plot(step, loss, alpha=0.5, c=col)
-            ax[x,y].plot(movavg_step(step), movavg(loss), label = "training", c=col)
-            ax[x,y].set_xlabel("epoch")
-            ax[x,y].set_ylabel(losses[ii])
-
-            if ("val" + losses[ii]+"_epoch") in val_epoch:
-                loss = val_epoch["val" +losses[ii]+"_epoch"]
-                step = val_epoch["epoch"]
-                ax[x,y].plot(step, loss, alpha=0.5, c=valcol)
-                ax[x,y].plot(movavg_step(step), movavg(loss), label = "validation", c=valcol)
-    ax[0,0].legend()
-    fig.savefig(outfile, dpi=300)
-
-    plt.close(fig)
+   
 
 # Example usage
 
 
 infile = "/home/vuillemr/cryofold/particlesSNR1.0/run_test/metrics.csv"
-outfile = "/home/vuillemr/cryofold/particlesSNR1.0/run_test/metrics.png"
-w= 10
+outfile = "/home/vuillemr/cryofold/particlesSNR1.0/run_test/metrics.svg"
 
+train_step, train_epoch, val_step, val_epoch = parse_lightning_csv(infile)
 
+movavg = lambda arr,w: np.convolve(
+    np.nan_to_num(arr), np.ones(w), 'valid'
+) / np.convolve(~np.isnan(arr), np.ones(w), 'valid')
+movavg_step = lambda arr,w: arr[:-(w-1)]*(len(arr)/(len(arr)-w))
 
+losses=["data_loss", "chi_loss", "viol_loss","pose_rot", "kld", "loss"]
+col = "tab:blue"
+valcol = "tab:green"
+nrows = 2
+ncols=3
+fig, ax = plt.subplots(nrows,ncols, figsize=(10,5), layout="constrained")
+for x in range(nrows):
+    for y in range(ncols):
+        ii = x *ncols + y
+        if ii>=len(losses):
+            break
 
+        if not losses[ii]+"_step" in train_step:
+            break
+
+        loss = train_step[losses[ii]+"_step"]
+        step = train_step["step"] * (train_step["epoch"].max() - train_step["epoch"].min()) / (train_step["step"].max() - train_step["step"].min())
+        if len(step)>50:
+            w = min(len(step)//10,10)
+            ax[x,y].plot(step, loss, alpha=0.5, c=col)
+            ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "training", c=col)
+        else:
+            ax[x,y].plot(step, loss, label = "training", c=col)
+
+        ax[x,y].set_xlabel("epoch")
+        ax[x,y].set_ylabel(losses[ii])
+
+        if ("val_" + losses[ii]+"_epoch") in val_epoch:
+            loss = val_epoch["val_" +losses[ii]+"_epoch"]
+            step = val_epoch["epoch"]
+            if len(step)>50:
+                w = min(len(step)//10,10)
+                ax[x,y].plot(step, loss, alpha=0.5, c=valcol)
+                ax[x,y].plot(movavg_step(step,w), movavg(loss,w), label = "validation", c=valcol)
+            else:
+                ax[x,y].plot(step, loss, label = "validation", c=valcol)
+
+ax[0,0].legend()
+fig.savefig(outfile, dpi=300)
+
+plt.close(fig)
 
 from openfold.model.primitives import Attention
 from openfold.model.triangular_multiplicative_update import (FusedTriangleMultiplicationOutgoing,FusedTriangleMultiplicationIncoming,
@@ -953,37 +970,26 @@ torch.cuda.reset_peak_memory_stats(device)
 out = a(q_x, kv_x, mask)
 # out = a(q_x, kv_x, biases)
 
-print(out.requires_grad)
-
-
-print("After forward:")
-print(f"Allocated: {torch.cuda.memory_allocated(device)/1e6:.2f} MB")
-print(f"Peak: {torch.cuda.max_memory_allocated(device)/1e6:.2f} MB")
 
 # backward
 loss = out.pow(2).sum()
 loss.backward()
 
-print("After backward:")
-print(f"Allocated: {torch.cuda.memory_allocated(device)/1e6:.2f} MB")
-print(f"Peak: {torch.cuda.max_memory_allocated(device)/1e6:.2f} MB")
+print(c_kv.grad is None)
 
 
-unused = []
-used=[]
-for name, param in a.named_parameters():
-    if param.requires_grad and param.grad is None:
-        unused.append(name)
-    else:
-        used.append(name)
-if unused:
-    print("⚠️ Unused parameters detected:", unused)
-
-if used:
-    print("⚠️ Used parameters detected:", used)
 
 
-del q_x, kv_x, out, loss, a,mask
-import  gc
-gc.collect()
-torch.cuda.empty_cache()
+
+
+
+from cryodrgn.commands_utils.fsc import get_fsc_curve, get_fsc_thresholds
+from cryodrgn.mrcfile import parse_mrc
+import torch
+
+vol1,_ = parse_mrc("data/cryofold/particlesSNR1.0/bench_conv/analysis/pc1/vol_000001.mrc")
+vol2,_ = parse_mrc("data/cryofold/particlesSNR1.0/bench_conv/analysis/pc1/vol_000005.mrc")
+
+fsc = get_fsc_curve(torch.tensor(vol1)[:-1,:-1,:-1], torch.tensor(vol2)[:-1,:-1,:-1])
+
+get_fsc_thresholds(fsc, apix=2.2)

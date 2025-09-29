@@ -6,29 +6,21 @@ import torch
 from torch import Tensor
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-from torch.nn.parallel import DataParallel
-from cryodrgn import fft, lie_tools, utils
+from cryodrgn import fft, lie_tools
 import cryodrgn.config
 
-from openfold.utils.tensor_utils import tensor_tree_map
 from openfold.model.structure_module import StructureModule
 from openfold.utils.feats import (
-    pseudo_beta_fn,
-    build_extra_msa_feat,
     atom14_to_atom37,
 )
 from functools import reduce
 import operator
 
 
-from cryodrgn.mrcfile import write_mrc, parse_mrc
 from openfold.config import model_config
 import openfold.np.residue_constants as rc
 from openfold.utils.tensor_utils import (
     add,
-    dict_multimap,
-    tensor_tree_map,
 )
 import os
 
@@ -42,16 +34,18 @@ from openfold.model.template import TemplatePairStack
 from openfold.model.primitives import Linear
 Norm = Sequence[Any]  # mean, std
 
-from openfold.utils.import_weights import import_jax_weights_, import_openfold_weights_
 from openfold.utils.script_utils import get_model_basename
 import os
 from openfold.utils.import_weights import  process_translation_dict, assign, Param, ParamType
 
 from openfold.data import mmcif_parsing
 from openfold.data.data_pipeline import add_assembly_features, make_sequence_features, convert_monomer_features
-from openfold.model.model import AlphaFold
-from flexfold.core import output_single_pdb
 from openfold.data.data_pipeline import  DataPipelineMultimer, DataPipeline
+
+from typing import Any, Tuple, List, Callable, Optional
+import torch
+import torch.utils.checkpoint
+
 
 
 class HetOnlyVAE(nn.Module):
@@ -708,6 +702,8 @@ class AFDecoder(torch.nn.Module):
                 target_file, 
                 DataPipelineMultimer(DataPipeline(None)) if is_multimer else DataPipeline(None)
             )
+            assert all(target_feats["aatype"] == embeddings["aatype"])
+            assert all(target_feats["asym_id"] == embeddings["asym_id"])
 
 
         def make_gt(feats):
@@ -740,15 +736,20 @@ class AFDecoder(torch.nn.Module):
 
         if self.pair_stack : 
             if self.new:
+                self.no_latent = 4
+                self.linear_z = Linear(self.zdim, self.no_latent*self.zdim)
+
                 self.decoder_ = CryoFormerStack(
                     c_z=self.outdim,
                     c_latent=self.zdim,
                     c_hidden=self.hidden_dim,
+                    c_hidden_mul=128,
+                    c_hidden_bias=32,
                     no_heads=4,
                     no_blocks=layers,
                     transition_n=2,
                     dropout_rate=0.15,
-                    blocks_per_ckpt=None
+                    blocks_per_ckpt=1
                 )
                 # self.embeddings["pair"].requires_grad = True
                 # self.embeddings["seq_mask"].requires_grad = True
@@ -812,9 +813,12 @@ class AFDecoder(torch.nn.Module):
             pos_mask = embedding_expand["seq_mask"]
             pair_mask = pos_mask[..., None] * pos_mask[..., None, :]
             if self.new:
+
+                latent = self.linear_z(z).view( batch_dim+(self.no_latent ,z.shape[-1]))
+
                 pair_update = self.decoder_(
                         z=embedding_expand["pair"],
-                        latent=z[..., None, None, :],
+                        latent=latent[..., None, :, :],
                         mask=pair_mask
                 )
             else:
@@ -1178,10 +1182,45 @@ def generate_translation_dict_sm(model, version, is_multimer=False):
     return translations
 
 
+from Bio.PDB import PDBParser, MMCIFIO
+from io import StringIO
+
+
+def pdb_string_to_mmcif_string(pdb_str: str) -> str:
+    """
+    Convert a PDB structure given as a string to an MMCIF string.
+
+    Args:
+        pdb_str: str, contents of a PDB file.
+
+    Returns:
+        mmcif_str: str, MMCIF format as a string.
+    """
+    # Parse PDB from string
+    pdb_io = StringIO(pdb_str)
+    parser = PDBParser(QUIET=True)
+    structure = parser.get_structure("structure", pdb_io)
+
+    # Prepare MMCIF writer
+    mmcif_io = MMCIFIO()
+    mmcif_io.set_structure(structure)
+
+    # Save to string buffer
+    buffer = StringIO()
+    mmcif_io.save(buffer)
+    mmcif_str = buffer.getvalue()
+    buffer.close()
+    return mmcif_str
+
+
 def get_target_feats(mmcif_file,data_processor):
 
     with open(mmcif_file, 'r') as f:
         mmcif_string = f.read()
+
+    ext = os.path.splitext(mmcif_file)[1].lower()
+    if ext in [".pdb"]: 
+        mmcif_string = pdb_string_to_mmcif_string(mmcif_string)
 
     mmcif_object = mmcif_parsing.parse(
         file_id="1HZH", mmcif_string=mmcif_string
@@ -1246,20 +1285,25 @@ from typing import Optional, List
 from functools import partialmethod, partial
 from openfold.model.dropout import DropoutRowwise, DropoutColumnwise
 from openfold.utils.tensor_utils import add
-from openfold.utils.checkpointing import checkpoint_blocks
 
 class TriangleCrossAttention(nn.Module):
     def __init__(
-        self, c_q, c_kv, c_hidden, no_heads, inf=1e9
+        self, c_q, c_kv, c_hidden,c_hidden_bias, no_heads, inf=1e9
     ):
         super(TriangleCrossAttention, self).__init__()
         self.c_q = c_q
         self.c_kv = c_kv
         self.c_hidden = c_hidden
+        self.c_hidden_bias = c_hidden_bias
         self.no_heads = no_heads
         self.inf = inf
+
         self.layer_norm = LayerNorm(self.c_q)
-        # self.linear = Linear(self.c_q, self.no_heads, bias=False, init="normal")
+
+        self.linear_x = Linear(self.c_q, no_heads*c_hidden_bias, bias=False, init="normal")
+
+        self.linear_z = Linear(self.c_kv, no_heads*c_hidden_bias, bias=False, init="normal")
+
         self.mha = Attention(
             self.c_q, self.c_kv, self.c_kv, self.c_hidden, self.no_heads
         )
@@ -1272,6 +1316,10 @@ class TriangleCrossAttention(nn.Module):
         inplace_safe: bool = False,
         **kwargs
     ) -> torch.Tensor:
+    
+        N = x.shape[-2]
+        M = z.shape[-2]
+        B = x.shape[:-3]
 
         if mask is None:
             # [*, I, J]
@@ -1281,9 +1329,28 @@ class TriangleCrossAttention(nn.Module):
         # [*, I, J, C_in]
         x = self.layer_norm(x)
 
+
+        # [*, N, H*C_b]
+        x_bias = self.linear_x(x).mean(dim=-2)
+
+        # [*, N, H*C_b]
+        x_bias = x_bias.view(B+( N, self.no_heads, self.c_hidden_bias))
+
+        # [*, M, H*C_b]
+        z_bias = self.linear_z(z)
+        
+        # [*, M, H*C_b]
+        z_bias = z_bias.view(B+( M, self.no_heads, self.c_hidden_bias))   
+
+        # [*, H, N, M]
+        triangle_bias = torch.einsum("bnhd,bmhd->bhnm", x_bias, z_bias)
+
+        # [*, 1, H, N, M]
+        triangle_bias = triangle_bias[..., None, :, :, :]
+
         # [*, I, 1, 1, J]
         mask_bias = (self.inf * (mask - 1))[..., :, None, :, None]
-        biases = [mask_bias]
+        biases = [mask_bias,triangle_bias]
         
         x = self.mha(
                 q_x=x, 
@@ -1301,6 +1368,8 @@ class CryoFormerBlock(nn.Module):
         c_z: int,
         c_latent:int,
         c_hidden: int,
+        c_hidden_mul:int,
+        c_hidden_bias:int,
         no_heads: int,
         transition_n: int,
         dropout_rate: float,
@@ -1309,10 +1378,20 @@ class CryoFormerBlock(nn.Module):
     ):
         super(CryoFormerBlock, self).__init__()
 
+        self.tri_mul_out = TriangleMultiplicationOutgoing(
+            c_z,
+            c_hidden_mul,
+        )
+        self.tri_mul_in = TriangleMultiplicationIncoming(
+            c_z,
+            c_hidden_mul,
+        )
+
         self.tri_att_start = TriangleCrossAttention(
             c_z,
             c_latent,
             c_hidden,
+            c_hidden_bias,
             no_heads,
             inf=inf,
         )
@@ -1320,6 +1399,7 @@ class CryoFormerBlock(nn.Module):
             c_z,
             c_latent,
             c_hidden,
+            c_hidden_bias,
             no_heads,
             inf=inf,
         )
@@ -1340,7 +1420,33 @@ class CryoFormerBlock(nn.Module):
         use_lma: bool = False,
         _attn_chunk_size: Optional[int] = None
     ) -> torch.Tensor:
-        
+
+        tmu_update = self.tri_mul_out(
+            z,
+            mask=pair_mask,
+            inplace_safe=inplace_safe,
+            _add_with_inplace=True,
+        )
+        if (not inplace_safe):
+            z = z + self.ps_dropout_row_layer(tmu_update)
+        else:
+            z = tmu_update
+
+        del tmu_update
+
+        tmu_update = self.tri_mul_in(
+            z,
+            mask=pair_mask,
+            inplace_safe=inplace_safe,
+            _add_with_inplace=True,
+        )
+        if (not inplace_safe):
+            z = z + self.ps_dropout_row_layer(tmu_update)
+        else:
+            z = tmu_update
+
+        del tmu_update
+
         z = add(z,
                 self.ps_dropout_row_layer(
                     self.tri_att_start(
@@ -1396,6 +1502,8 @@ class CryoFormerStack(nn.Module):
         c_z,
         c_latent,
         c_hidden,
+        c_hidden_mul,
+        c_hidden_bias,
         no_heads,
         no_blocks,
         transition_n,
@@ -1415,6 +1523,8 @@ class CryoFormerStack(nn.Module):
                 c_z=c_z,
                 c_latent=c_latent,
                 c_hidden=c_hidden,
+                c_hidden_mul=c_hidden_mul,
+                c_hidden_bias=c_hidden_bias,
                 no_heads=no_heads,
                 transition_n=transition_n,
                 dropout_rate=dropout_rate,
@@ -1460,3 +1570,53 @@ class CryoFormerStack(nn.Module):
 
         return z
 
+
+
+
+
+BLOCK_ARG = Any
+BLOCK_ARGS = List[BLOCK_ARG]
+
+
+def get_checkpoint_fn():
+    checkpoint = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+    return checkpoint
+
+
+@torch.jit.ignore
+def checkpoint_blocks(
+    blocks: List[Callable],
+    args: BLOCK_ARGS,
+    blocks_per_ckpt: Optional[int],
+) -> BLOCK_ARGS:
+
+    def wrap(a):
+        return (a,) if type(a) is not tuple else a
+
+    def exec(b, a):
+        for block in b:
+            a = wrap(block(*a))
+        return a
+
+    def chunker(s, e):
+        def exec_sliced(*a):
+            return exec(blocks[s:e], a)
+
+        return exec_sliced
+
+    # Avoids mishaps when the blocks take just one argument
+    args = wrap(args)
+
+    if blocks_per_ckpt is None or not torch.is_grad_enabled():
+        return exec(blocks, args)
+    elif blocks_per_ckpt < 1 or blocks_per_ckpt > len(blocks):
+        raise ValueError("blocks_per_ckpt must be between 1 and len(blocks)")
+
+    checkpoint = get_checkpoint_fn() 
+
+    for s in range(0, len(blocks), blocks_per_ckpt):
+        e = s + blocks_per_ckpt
+        args = checkpoint(chunker(s, e), *args)
+        args = wrap(args)
+
+    return args
