@@ -571,5 +571,8 @@ python ./scripts/train.py $BASE_DIR/Particles/particles.mrcs  \
     --devices 1
     
 
-python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --trajectory
+
+BASE_DIR="../cryofold/particlesSNR1.0"
+RUN_DIR=$BASE_DIR/bench_cryofomer_optim_large
+python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2 --backproject  --particles $BASE_DIR/Particles/particles.mrcs --poses $BASE_DIR/particles.pkl --ctf $BASE_DIR/ctf.pkl
 python ./scripts/compare_traj.py "$RUN_DIR/analysis/traj/*pdb" "$BASE_DIR/gt_pdbs/*pdb" $RUN_DIR/analysis/stats.txt

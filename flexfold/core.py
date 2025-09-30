@@ -11,6 +11,7 @@ from openfold.np import residue_constants, protein
 from openfold.utils.tensor_utils import tensor_tree_map
 from cryodrgn.fft import fftshift
 from torch.fft import ifft2
+import  openfold.np.residue_constants as rc
 
 def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file, chain_index=None, residue_index=None):
 
@@ -221,7 +222,7 @@ def lattice_ft_3D(device, grid_size = 128, sigma = 1.0, pixel_size=1.0):
     return torch.stack((u,v, w)).T
 
 
-def img_ft_lattice(crd, crd_lattice, sigma = 1.0, pixel_size=1.0, crd_mask=None):
+def img_ft_lattice(crd, crd_lattice, sigma = 1.0, pixel_size=1.0, crd_mask=None, coef=None):
     # crd 
     #   [batch_dim, N_atoms, 3]
     # crd_mask  
@@ -240,9 +241,11 @@ def img_ft_lattice(crd, crd_lattice, sigma = 1.0, pixel_size=1.0, crd_mask=None)
 
     F = torch.exp(-2j * torch.pi * torch.sum(crd[...,None, :] * crd_lattice[..., None, :,:], dim=-1))
     if crd_mask is not None:
-        F = torch.sum(crd_mask[..., None] *  F, dim=-2)
-    else:
-        F = torch.sum(F, dim=-2)
+        F *= crd_mask[..., None]
+    if coef is not None:
+        F *= coef[..., None]
+        
+    F = torch.sum(F, dim=-2)
 
     F /= 2* torch.pi
 
@@ -343,7 +346,7 @@ def img_real(crd, grid_size = 128, sigma = 1.0, pixel_size=1.0):
     return  I.reshape(batch_dim+(grid_size, grid_size))
 
 
-def img_real_mask(crd, pix_loc, pix_mask, grid_size=128, sigma=1.0, pixel_size=1.0):
+def img_real_mask(crd, pix_loc, pix_mask, grid_size=128, sigma=1.0, pixel_size=1.0, coef=None):
     B, N_atoms, P = pix_mask.shape
 
     # Compute (x, y) positions in real space
@@ -353,6 +356,8 @@ def img_real_mask(crd, pix_loc, pix_mask, grid_size=128, sigma=1.0, pixel_size=1
     # Compute Gaussian contributions
     sq_dist = torch.sum((xy - crd_xy) ** 2, dim=-1)    # (B, N_atoms, P)
     I = torch.exp(-0.5 * sq_dist / sigma**2) * pix_mask  # (B, N_atoms, P)
+    if coef is not None:
+        I = I *  coef[..., None] 
 
     # Flatten for scatter
     flat_I = I.reshape(B, -1)                                # (B, N_atoms * P)
@@ -375,7 +380,7 @@ def img_real_mask(crd, pix_loc, pix_mask, grid_size=128, sigma=1.0, pixel_size=1
 
     return I_out.transpose(-2,-1)
 
-def vol_real_mask(crd, pix_loc, pix_mask, grid_size=128, sigma=1.0, pixel_size=1.0, amplitude=None):
+def vol_real_mask(crd, pix_loc, pix_mask, grid_size=128, sigma=1.0, pixel_size=1.0, coef=None):
     B, N_atoms, P = pix_mask.shape
 
     # Compute (x, y) positions in real space
@@ -386,8 +391,8 @@ def vol_real_mask(crd, pix_loc, pix_mask, grid_size=128, sigma=1.0, pixel_size=1
     sq_dist = torch.sum((xyz - crd_xyz) ** 2, dim=-1)    # (B, N_atoms, P)
     I = torch.exp(-0.5 * sq_dist / sigma**2) * pix_mask  # (B, N_atoms, P)
 
-    if amplitude is not None : 
-        I *= amplitude[..., None]
+    if coef is not None : 
+        I *= coef[..., None]
 
     # Flatten for scatter
     flat_I = I.reshape(B, -1)                                # (B, N_atoms * P)
@@ -467,3 +472,44 @@ def vol_real(crd, grid_size = 128, sigma = 1.0, pixel_size=1.0):
     I /= (2 * torch.pi * sigma**2)
     return  I.reshape(batch_dim + (grid_size, grid_size, grid_size))
 
+
+
+def aatype_to_coefs(aatype):
+    atomdefs={'H':(1.0,1.00794),'HO':(1.0,1.00794),'C':(6.0,12.0107),'A':(7.0,14.00674),'N':(7.0,14.00674),'O':(8.0,15.9994),'P':(15.0,30.973761),'K':(19.0,39.0983),
+        'S':(16.0,32.066),'W':(18.0,1.00794*2.0+15.9994),'AU':(79.0,196.96655) }
+
+    def atom_name_to_coef(atomlist):
+        return [atomdefs[c[:1]][0] if c != "" else 0.0 for c in atomlist]
+
+    def aatype_to_14_names(a):
+        return rc.restype_name_to_atom14_names[rc.restype_1to3[rc.restypes[a]]]
+
+    n = aatype.shape[-1]
+    coef37 = aatype.new_zeros((n, 37))
+
+    for i in range(aatype.shape[-1]):
+        coef37[i][rc.RESTYPE_ATOM14_TO_ATOM37[aatype[i]]] =  torch.tensor( 
+            atom_name_to_coef(aatype_to_14_names(aatype[i]))
+        , device=aatype.device, dtype=aatype.dtype
+        )
+    return coef37
+
+def aatype_to_flat_coefs(aatype, mask, ca=True):
+
+    coefs = aatype_to_coefs(aatype)
+    n = aatype.shape[-1]
+
+    assert ( ((coefs ==0.0) * (mask==0.0)).sum() == (mask==0.0).sum() )
+    # assert ( ((coefs !=0.0) * (mask==1.0)).sum() == (mask==1.0).sum() )
+
+
+    if ca:
+        coefs = coefs[mask[...,1]==1.0].sum(dim=-1)
+    else:
+        flat_idx_shape = (n*37, )
+        coefs = (coefs * mask).view(flat_idx_shape)
+        coefs = coefs[mask.view(flat_idx_shape) == 1.0]
+
+    assert all(coefs != 0.0)
+
+    return coefs

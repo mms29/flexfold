@@ -357,6 +357,153 @@ for i in range(zdim-1):
 fig.savefig("/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/analysis/test_z.svg")
 
 ##################################################""
+# FSC
+##################################################""
+
+from cryodrgn.commands_utils.fsc import get_fsc_curve, get_fsc_thresholds,calculate_cryosparc_fscs
+from cryodrgn.commands_utils.plot_fsc import create_fsc_plot
+from cryodrgn.mrcfile import parse_mrc, write_mrc
+import torch
+import numpy as np
+import matplotlib as plt
+from flexfold.core import aatype_to_flat_coefs, struct_to_pdb
+from openfold.utils.tensor_utils import tensor_tree_map
+
+import numpy as np
+import glob
+from Bio.SVDSuperimposer import SVDSuperimposer
+from Bio.PDB import PDBParser, Superimposer, is_aa
+import argparse
+
+import itertools
+from Bio.PDB import PDBParser, Superimposer, is_aa
+from Bio.PDB.Polypeptide import PPBuilder
+from Bio import pairwise2
+from Bio.Data.IUPACData import protein_letters_3to1
+
+def seq_from_chain(chain):
+    """Return (seq, atoms) for a chain."""
+    ppb = PPBuilder()
+    seq, atoms = "", []
+    for pp in ppb.build_peptides(chain):
+        for residue in pp:
+            if is_aa(residue, standard=True) and "CA" in residue:
+                seq += protein_letters_3to1.get(residue.resname.capitalize(), "X")
+                atoms.append(residue["CA"])
+    return seq, atoms
+
+
+def align_atoms(seq1, atoms1, seq2, atoms2):
+    """Align two chains by sequence and return matched CA atoms."""
+    aln = pairwise2.align.globalxx(seq1, seq2, one_alignment_only=True)[0]
+    aln1, aln2 = aln.seqA, aln.seqB
+
+    matched1, matched2 = [], []
+    i1 = i2 = 0
+    for a1, a2 in zip(aln1, aln2):
+        atom1 = atom2 = None
+        if a1 != "-":
+            atom1 = atoms1[i1]; i1 += 1
+        if a2 != "-":
+            atom2 = atoms2[i2]; i2 += 1
+        if atom1 and atom2:
+            matched1.append(atom1)
+            matched2.append(atom2)
+    return matched1, matched2
+
+def rmsd_best_permutation(struct1, struct2):
+    """Compute RMSD between two structures, testing all chain permutations."""
+    chains1 = list(struct1[0])  # first model only
+    chains2 = list(struct2[0])
+    if len(chains1) != len(chains2):
+        raise ValueError("Different number of chains — need special handling.")
+
+    # Extract seqs and atoms
+    seq_atoms1 = [seq_from_chain(c) for c in chains1]
+    seq_atoms2 = [seq_from_chain(c) for c in chains2]
+
+    best_rmsd, best_perm, best_rotran = float("inf"), None, None
+
+    # Try all chain permutations
+    for perm in itertools.permutations(range(len(chains2))):
+        all1, all2 = [], []
+        for i, j in enumerate(perm):
+            s1, a1 = seq_atoms1[i]
+            s2, a2 = seq_atoms2[j]
+            m1, m2 = align_atoms(s1, a1, s2, a2)
+            all1.extend(m1)
+            all2.extend(m2)
+
+        if not all1:
+            continue
+
+        sup = Superimposer()
+        sup.set_atoms(all1, all2)
+        if sup.rms < best_rmsd:
+            best_rmsd = sup.rms
+            best_perm = perm
+            best_rotran = sup.rotran
+
+    return best_rmsd, best_perm, best_rotran
+
+
+
+apix = 3.0
+res = 3.0
+sigma = (res/(apix))
+
+z = load_pkl("/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/z.20.pkl")
+nz = z.shape[0]
+from flexfold import dataset
+imageDataset = dataset.ImageDataset(
+    mrcfile="../cryofold/cryobench_IgD/IgG-1D/images/snr0.01/sorted_particles.128.txt",
+    lazy=False,
+    norm=None,
+    invert_data=True,
+    ind=None,
+    window=True,
+    datadir=None,
+    window_r=0.85,
+    max_threads=1,
+    domain="hartley",
+)
+model.decoder.sigma=1.0
+model.decoder.all_atom=True
+model.decoder.atom_coefs = aatype_to_flat_coefs(model.decoder.embeddings["aatype"], model.decoder.embeddings["final_atom_mask"], ca =not model.decoder.all_atom)
+
+batch = next(iter(imageDataset))
+
+y, y_real, rot, tran, c = model.prepare_batch(batch)
+
+z_mu, z_logvar = model.encoder()
+zval = torch.tensor(z[3]).to(device)
+v,s = model.decoder.eval_volume(zval, D-1, None, None,zval )
+v = v.detach().cpu()
+struct_to_pdb(tensor_tree_map(lambda x: x.detach().cpu().numpy()[-1], s), "data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/test.pdb")
+write_mrc("data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/test.mrc", v.numpy(), Apix=3.0)
+del s, zval
+import gc
+gc.collect()
+torch.cuda.empty_cache()
+
+vol,header =parse_mrc("data/cryofold/cryobench_IgD/IgG-1D/vols/128_org/000.mrc")
+vol =  torch.tensor(vol)
+apix = header.apix
+fsc = get_fsc_curve(v, vol)
+fscauc = np.trapz(np.array(fsc["fsc"]), np.array(fsc["pixres"]))
+fsc_res = get_fsc_thresholds(fsc, apix=apix)
+create_fsc_plot(fsc, "data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/analysis/fsc.png", apix)
+
+
+parser = PDBParser(QUIET=True)
+structure1 = parser.get_structure("ref", "data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/test.pdb")
+structure2 = parser.get_structure("mobile", "data/cryofold/cryobench_IgD/IgG-1D/pdbs/000.pdb")
+rmsd,_,_ = rmsd_best_permutation(structure1, structure2)
+
+
+
+
+##################################################""
 # DIMENTIONALITY REDUCTION
 ##################################################""
 
@@ -982,14 +1129,3 @@ print(c_kv.grad is None)
 
 
 
-
-from cryodrgn.commands_utils.fsc import get_fsc_curve, get_fsc_thresholds
-from cryodrgn.mrcfile import parse_mrc
-import torch
-
-vol1,_ = parse_mrc("data/cryofold/particlesSNR1.0/bench_conv/analysis/pc1/vol_000001.mrc")
-vol2,_ = parse_mrc("data/cryofold/particlesSNR1.0/bench_conv/analysis/pc1/vol_000005.mrc")
-
-fsc = get_fsc_curve(torch.tensor(vol1)[:-1,:-1,:-1], torch.tensor(vol2)[:-1,:-1,:-1])
-
-fsc_res = get_fsc_thresholds(fsc, apix=2.2)

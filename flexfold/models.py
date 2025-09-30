@@ -26,7 +26,7 @@ import os
 
 from flexfold.lattice import Lattice
 from flexfold.core import (img_ft_lattice, img_ht_lattice, img_real, get_pixel_mask, 
-                            img_real_mask, vol_real_mask, get_voxel_mask, register_crd_to_vol)
+                            img_real_mask, vol_real_mask, get_voxel_mask, register_crd_to_vol, aatype_to_flat_coefs)
 
 from openfold.utils.import_weights import convert_deprecated_v1_keys
 from openfold.data import data_transforms
@@ -174,7 +174,7 @@ class HetOnlyVAE(nn.Module):
         )
         if weights is not None:
             ckpt = torch.load(weights)
-            model.load_state_dict(ckpt["model_state_dict"])
+            model.load_state_dict(ckpt["model_state_dict"], strict = False) #FIXME: struct=True
         if device is not None:
             model.to(device)
         return model, lat
@@ -725,6 +725,7 @@ class AFDecoder(torch.nn.Module):
             embeddings = f(embeddings)
 
         self.embeddings = BufferDict(embeddings)
+        self.register_buffer("atom_coefs", aatype_to_flat_coefs(embeddings["aatype"], embeddings["final_atom_mask"], ca =not self.all_atom))
 
         self.res_size = self.embeddings["pair"].shape[-2]
         self.outdim = self.embeddings["pair"].shape[-1]
@@ -777,6 +778,7 @@ class AFDecoder(torch.nn.Module):
 
         self.n_pix_cutoff=int(np.ceil(quality_ratio * self.sigma / self.pixel_size) * 2 + 1)    
 
+
         print("--\n AF DECODER PARAMETERS :")
         print("\t mode : %s"%("real space" if isinstance(self, AFDecoderReal) else "reciprocal"))
         print("\t domain : %s"%(domain))
@@ -795,7 +797,8 @@ class AFDecoder(torch.nn.Module):
             crd=crd, 
             crd_lattice=crd_lattice, 
             sigma = self.sigma, 
-            pixel_size=self.pixel_size
+            pixel_size=self.pixel_size,
+            coef = self.atom_coefs
         )
         return y_recon, struct
 
@@ -929,7 +932,8 @@ class AFDecoder(torch.nn.Module):
             vox_mask, 
             D, 
             self.sigma, 
-            self.pixel_size
+            self.pixel_size,
+            coef = self.atom_coefs
         )
 
         return vol[-1].detach(), struct
@@ -984,7 +988,8 @@ class AFDecoderReal(AFDecoder):
             pix_mask, 
             self.lattice_size, 
             self.sigma, 
-            self.pixel_size
+            self.pixel_size,
+            coef = self.atom_coefs
         )
         y_recon = fft.fft2_center(y_recon_real)
 
