@@ -134,4 +134,21 @@ python ~/flexfold//scripts/train.py $BASE_DIR/particles_downsampled.mrcs  \
     --pair_stack\
     --debug\
 
-python ./scripts/analyze.py  -o $RUN_DIR/analysis $RUN_DIR 0 --pc 2
+BASE_DIR="/home/vuillemr/flexfold/data/cryofold/jillsData/particles"
+RUN_DIR=$BASE_DIR/run_cryodrgn
+
+cryodrgn train_vae $BASE_DIR/particles_downsampled.mrcs  \
+    --poses $BASE_DIR/particles.pkl \
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --batch-size 1024  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 256 \
+    --enc-layers 3 \
+    --dec-dim 256 \
+    --dec-layers 3 \
+
+
+cryodrgn analyze  -o $RUN_DIR/analysis $RUN_DIR 64 --pc 2

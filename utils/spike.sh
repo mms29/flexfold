@@ -40,11 +40,16 @@ python -u ./scripts/train.py \
   --batch-size 1  \
   --num-workers 0 \
   --zdim 2  \
-  --enc-dim 32 \
+  --enc-dim 16 \
   --enc-layers 6 \
   --dec-dim 32 \
   --dec-layers 1 \
   --encode-mode conv\
+  --pair_stack\
+  --frozen_structure_module\
+    --wd 1e-4\
+  --lr 5e-4\
+  --warmup 100 \
   --domain real \
   --overwrite \
   --multimer \

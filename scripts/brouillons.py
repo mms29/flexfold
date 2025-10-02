@@ -308,431 +308,6 @@ write_star_from_dict(rln2xmp(star["data_particles"]), "/home/vuillemr/flexfold/d
 
 
 
-########################################################################""
-import torch 
-from flexfold.models import HetOnlyVAE
-from cryodrgn import config
-from cryodrgn.utils import load_pkl
-import matplotlib.pyplot as plt
-
-config_file = "/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/config.yaml"
-weight_file = "/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/weights.20.pkl"
-
-##################################################""
-# LOAD MODEL and WEIGHTS
-##################################################""
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-cfg = config.load(config_file)
-D = cfg["lattice_args"]["D"]  # image size + 1
-zdim = cfg["model_args"]["zdim"]
-norm = [float(x) for x in cfg["dataset_args"]["norm"]]
-model, lattice = HetOnlyVAE.load(cfg,weight_file, device=device)
-model.eval()
-
-##################################################""
-# LOAD Z
-##################################################""
-z = load_pkl("/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/z.20.pkl")
-zdim = z.shape[-1]
-##################################################""
-# PLOT Z
-##################################################""
-kwargs = {
-    "c":[i for i in range(len(z))],
-    "cmap":"jet",
-    "alpha":0.5,
-    "s":0.1
-}
-fig, ax = plt.subplots(zdim-1,zdim-1, figsize=(10,10), layout="constrained")
-for i in range(zdim-1):
-    for j in range(1, zdim):
-        if not i>=j:
-            ax[j-1,i].scatter(z[:,i], z[:,j], **kwargs)
-            ax[j-1,i].set_xlabel("Z%i"%i, fontsize=15)
-            ax[j-1,i].set_ylabel("Z%i"%j, fontsize=15)
-        else:
-            ax[j-1,i].set_visible(False)
-
-fig.savefig("/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/analysis/test_z.svg")
-
-##################################################""
-# FSC
-##################################################""
-
-from cryodrgn.commands_utils.fsc import get_fsc_curve, get_fsc_thresholds,calculate_cryosparc_fscs
-from cryodrgn.commands_utils.plot_fsc import create_fsc_plot
-from cryodrgn.mrcfile import parse_mrc, write_mrc
-import torch
-import numpy as np
-import matplotlib as plt
-from flexfold.core import aatype_to_flat_coefs, struct_to_pdb
-from openfold.utils.tensor_utils import tensor_tree_map
-
-import numpy as np
-import glob
-from Bio.SVDSuperimposer import SVDSuperimposer
-from Bio.PDB import PDBParser, Superimposer, is_aa
-import argparse
-
-import itertools
-from Bio.PDB import PDBParser, Superimposer, is_aa
-from Bio.PDB.Polypeptide import PPBuilder
-from Bio import pairwise2
-from Bio.Data.IUPACData import protein_letters_3to1
-
-def seq_from_chain(chain):
-    """Return (seq, atoms) for a chain."""
-    ppb = PPBuilder()
-    seq, atoms = "", []
-    for pp in ppb.build_peptides(chain):
-        for residue in pp:
-            if is_aa(residue, standard=True) and "CA" in residue:
-                seq += protein_letters_3to1.get(residue.resname.capitalize(), "X")
-                atoms.append(residue["CA"])
-    return seq, atoms
-
-
-def align_atoms(seq1, atoms1, seq2, atoms2):
-    """Align two chains by sequence and return matched CA atoms."""
-    aln = pairwise2.align.globalxx(seq1, seq2, one_alignment_only=True)[0]
-    aln1, aln2 = aln.seqA, aln.seqB
-
-    matched1, matched2 = [], []
-    i1 = i2 = 0
-    for a1, a2 in zip(aln1, aln2):
-        atom1 = atom2 = None
-        if a1 != "-":
-            atom1 = atoms1[i1]; i1 += 1
-        if a2 != "-":
-            atom2 = atoms2[i2]; i2 += 1
-        if atom1 and atom2:
-            matched1.append(atom1)
-            matched2.append(atom2)
-    return matched1, matched2
-
-def rmsd_best_permutation(struct1, struct2):
-    """Compute RMSD between two structures, testing all chain permutations."""
-    chains1 = list(struct1[0])  # first model only
-    chains2 = list(struct2[0])
-    if len(chains1) != len(chains2):
-        raise ValueError("Different number of chains — need special handling.")
-
-    # Extract seqs and atoms
-    seq_atoms1 = [seq_from_chain(c) for c in chains1]
-    seq_atoms2 = [seq_from_chain(c) for c in chains2]
-
-    best_rmsd, best_perm, best_rotran = float("inf"), None, None
-
-    # Try all chain permutations
-    for perm in itertools.permutations(range(len(chains2))):
-        all1, all2 = [], []
-        for i, j in enumerate(perm):
-            s1, a1 = seq_atoms1[i]
-            s2, a2 = seq_atoms2[j]
-            m1, m2 = align_atoms(s1, a1, s2, a2)
-            all1.extend(m1)
-            all2.extend(m2)
-
-        if not all1:
-            continue
-
-        sup = Superimposer()
-        sup.set_atoms(all1, all2)
-        if sup.rms < best_rmsd:
-            best_rmsd = sup.rms
-            best_perm = perm
-            best_rotran = sup.rotran
-
-    return best_rmsd, best_perm, best_rotran
-
-
-
-apix = 3.0
-res = 3.0
-sigma = (res/(apix))
-
-z = load_pkl("/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/z.20.pkl")
-nz = z.shape[0]
-from flexfold import dataset
-imageDataset = dataset.ImageDataset(
-    mrcfile="../cryofold/cryobench_IgD/IgG-1D/images/snr0.01/sorted_particles.128.txt",
-    lazy=False,
-    norm=None,
-    invert_data=True,
-    ind=None,
-    window=True,
-    datadir=None,
-    window_r=0.85,
-    max_threads=1,
-    domain="hartley",
-)
-model.decoder.sigma=1.0
-model.decoder.all_atom=True
-model.decoder.atom_coefs = aatype_to_flat_coefs(model.decoder.embeddings["aatype"], model.decoder.embeddings["final_atom_mask"], ca =not model.decoder.all_atom)
-
-batch = next(iter(imageDataset))
-
-y, y_real, rot, tran, c = model.prepare_batch(batch)
-
-z_mu, z_logvar = model.encoder()
-zval = torch.tensor(z[3]).to(device)
-v,s = model.decoder.eval_volume(zval, D-1, None, None,zval )
-v = v.detach().cpu()
-struct_to_pdb(tensor_tree_map(lambda x: x.detach().cpu().numpy()[-1], s), "data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/test.pdb")
-write_mrc("data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/test.mrc", v.numpy(), Apix=3.0)
-del s, zval
-import gc
-gc.collect()
-torch.cuda.empty_cache()
-
-vol,header =parse_mrc("data/cryofold/cryobench_IgD/IgG-1D/vols/128_org/000.mrc")
-vol =  torch.tensor(vol)
-apix = header.apix
-fsc = get_fsc_curve(v, vol)
-fscauc = np.trapz(np.array(fsc["fsc"]), np.array(fsc["pixres"]))
-fsc_res = get_fsc_thresholds(fsc, apix=apix)
-create_fsc_plot(fsc, "data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/analysis/fsc.png", apix)
-
-
-parser = PDBParser(QUIET=True)
-structure1 = parser.get_structure("ref", "data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/test.pdb")
-structure2 = parser.get_structure("mobile", "data/cryofold/cryobench_IgD/IgG-1D/pdbs/000.pdb")
-rmsd,_,_ = rmsd_best_permutation(structure1, structure2)
-
-
-
-
-##################################################""
-# DIMENTIONALITY REDUCTION
-##################################################""
-
-from umap import UMAP
-from sklearn.decomposition import PCA
-import numpy as np
-from sklearn.cluster import KMeans
-
-import numpy as np
-import itertools
-import tqdm
-from scipy.spatial.distance import pdist, squareform
-from scipy.sparse.csgraph import minimum_spanning_tree
-import numpy as np
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-import numpy as np
-from scipy.spatial import distance_matrix
-
-def tsp_nearest_neighbor(points):
-    """Simple nearest neighbor heuristic for TSP."""
-    n = len(points)
-    dist = distance_matrix(points, points)
-    unvisited = set(range(n))
-    path = [0]  # start at point 0 (arbitrary)
-    unvisited.remove(0)
-    
-    while unvisited:
-        last = path[-1]
-        next_idx = min(unvisited, key=lambda j: dist[last, j])
-        path.append(next_idx)
-        unvisited.remove(next_idx)
-    
-    return path
-
-def tsp_path_length(points, path):
-    """Compute length of a given TSP path."""
-    return sum(np.linalg.norm(points[path[i]] - points[path[i-1]])
-               for i in range(1, len(path)))
-
-# --- Optional: 2-opt optimization ---
-def two_opt(points, path):
-    """Try to improve TSP path using 2-opt."""
-    best = path
-    best_len = tsp_path_length(points, best)
-    improved = True
-    
-    while improved:
-        improved = False
-        for i in range(1, len(path) - 2):
-            for j in range(i+1, len(path)):
-                if j - i == 1:  # consecutive edges, skip
-                    continue
-                new_path = best[:i] + best[i:j][::-1] + best[j:]
-                new_len = tsp_path_length(points, new_path)
-                if new_len < best_len:
-                    best = new_path
-                    best_len = new_len
-                    improved = True
-        path = best
-    return best
-
-def solve_tsp(points):
-    n = len(points)
-    dist_matrix = np.linalg.norm(points[:,None] - points[None,:], axis=2)
-    
-    # Setup routing
-    manager = pywrapcp.RoutingIndexManager(n, 1, 0)
-    routing = pywrapcp.RoutingModel(manager)
-    
-    def distance_callback(i, j):
-        return int(dist_matrix[manager.IndexToNode(i)][manager.IndexToNode(j)] * 1000)
-    
-    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
-    
-    # Search
-    search_params = pywrapcp.DefaultRoutingSearchParameters()
-    search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_params.time_limit.seconds = 10
-    
-    solution = routing.SolveWithParameters(search_params)
-    
-    # Extract route
-    route = []
-    idx = routing.Start(0)
-    while not routing.IsEnd(idx):
-        route.append(manager.IndexToNode(idx))
-        idx = solution.Value(routing.NextVar(idx))
-    return route
-
-
-def order_clusters_greedy(centers):
-    remaining = list(range(len(centers)))
-    order = [remaining.pop(0)]  # start from first center
-    while remaining:
-        last = centers[order[-1]]
-        # find nearest remaining center
-        next_idx = min(remaining, key=lambda i: np.linalg.norm(last - centers[i]))
-        order.append(next_idx)
-        remaining.remove(next_idx)
-    return order
-
-def brute_force_tsp(points):
-    n = len(points)
-    best_order = None
-    best_length = float("inf")
-    
-    for perm in tqdm.tqdm(itertools.permutations(range(n))):
-        length = np.sum(np.linalg.norm(points[perm[i]] - points[perm[i-1]]) 
-                        for i in range(1, n))
-        if length < best_length:
-            best_length = length
-            best_order = perm
-    return np.array(best_order)
-
-def tsp_bidirectional(points):
-    """Build a TSP tour by growing in both directions from each possible start."""
-    n = len(points)
-    dist = distance_matrix(points, points)
-    best_path, best_len = None, float("inf")
-    
-    for start in range(n):
-        left = [start]
-        right = []
-        unvisited = set(range(n)) - {start}
-        
-        # Alternate: choose nearest to either end
-        while unvisited:
-            # candidates from leftmost and rightmost ends
-            left_end, right_end = left[0], (right[-1] if right else left[-1])
-            
-            cand_left = min(unvisited, key=lambda j: dist[left_end, j])
-            cand_right = min(unvisited, key=lambda j: dist[right_end, j])
-            
-            if dist[left_end, cand_left] < dist[right_end, cand_right]:
-                left.insert(0, cand_left)
-                unvisited.remove(cand_left)
-            else:
-                right.append(cand_right)
-                unvisited.remove(cand_right)
-        
-        path = left + right
-        length = sum(np.linalg.norm(points[path[i]] - points[path[i-1]]) for i in range(1, n))
-        
-        if length < best_len:
-            best_path, best_len = path, length
-    
-    return np.array(best_path)
-
-def mst_traversal(centers):
-    dist = squareform(pdist(centers))
-    mst = minimum_spanning_tree(dist)
-    mst_dense = mst.toarray()              # convert to dense numpy array
-    mst_dense = mst_dense + mst_dense.T  # make symmetric
-    k = mst_dense.shape[0]
-    visited = [False] * k
-    order = []
-
-    # find a leaf node to start (node with only 1 connection)
-    degrees = (mst_dense > 0).sum(axis=1)
-    start = np.argmin(degrees)
-
-    def dfs(node):
-        visited[node] = True
-        order.append(node)
-        neighbors = np.where(mst_dense[node] > 0)[0]
-        for n in neighbors:
-            if not visited[n]:
-                dfs(n)
-
-    dfs(start)
-    return order
-
-# dimred = UMAP(n_components=2, n_neighbors=50, min_dist=0.1, random_state=42)
-dimred = PCA(n_components=2)
-data = dimred.fit_transform(z)
-
-n_clusters=9
-k_means = KMeans(init='k-means++', n_clusters=n_clusters)
-k_means.fit(data)
-centers = k_means.cluster_centers_ 
-labels = k_means.labels_
-
-# ordered_idx = mst_traversal(centers)
-# ordered_idx = brute_force_tsp(centers)
-# ordered_idx = order_clusters_greedy(centers)
-# ordered_idx = np.array(two_opt(centers, tsp_nearest_neighbor(centers)) )
-ordered_idx = tsp_bidirectional(centers)
-
-traj_center = centers[ordered_idx]
-old_to_new = {old: new for new, old in enumerate(ordered_idx)}
-traj_labels = np.array([old_to_new[l] for l in labels])
-
-cmap = "plasma"
-fig, ax = plt.subplots(1,1, figsize=(10,10))
-ax.scatter(data[:,0], data[:,1], cmap=cmap, alpha=0.5, c=traj_labels, s =10)
-ax.plot(traj_center[:,0], traj_center[:,1], "-", c="black")
-ax.scatter(traj_center[:,0], traj_center[:,1],s=200, cmap=cmap, c=[i for i in range(n_clusters)], edgecolors="black")
-fig.savefig("/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/analysis/test_umap.png")
-
-
-##################################################""
-# output models
-##################################################""
-from flexfold.core import struct_to_pdb
-from openfold.utils.tensor_utils import tensor_tree_map
-from cryodrgn.mrcfile import write_mrc
-
-indices = [traj_labels == i for i in range(n_clusters)]
-z_traj_avg = [np.mean(z[i], axis=0) for i in indices]
-z_traj_avg = torch.tensor(z_traj_avg, device=device)
-
-model.to(device)
-
-for i in range(n_clusters):
-    prefix = "/home/vuillemr/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run2/analysis/test%s"%str(i+1).zfill(5)
-    vol, struct = model.decoder.eval_volume(lattice.coords, D, lattice.extent,norm, z_traj_avg[i])
-    crd = struct["final_atom_positions"]
-    crd = crd @ model.decoder.rot_init + model.decoder.trans_init[..., None, :]
-    struct["final_atom_positions"] = crd
-    struct_to_pdb(tensor_tree_map(lambda x: x.detach().cpu().numpy()[-1], struct), 
-                  prefix+".pdb")
-
-    write_mrc(prefix+".mrc", np.array(vol.cpu()).astype(np.float32), Apix=3.0)
-
-
-
-
 
 
 
@@ -1129,3 +704,304 @@ print(c_kv.grad is None)
 
 
 
+###########################################################################################################################""
+import torch
+from flexfold.models import get_target_feats
+from openfold.data.data_pipeline import  DataPipelineMultimer, DataPipeline
+import numpy as np
+
+e = torch.load("../cryofold/cryobench_IgD/pred2/embeddings.pt", map_location="cuda:1")
+e["asym_id"]
+
+t = get_target_feats("../cryofold/cryobench_IgD/1HZH.cif",DataPipelineMultimer(DataPipeline(None)))
+(t["asym_id"] ==4).sum()
+
+
+
+def transpose_chains(t, transpose):
+    asym_id = t["asym_id"]
+    order = np.unique(t["asym_id"])[[i for i in transpose]]
+    order_ind = np.concatenate([np.where(asym_id==i)[0] for i in order])
+    new_asym_id = np.concatenate([(i+1)*np.ones((asym_id==o).sum()) for i,o in enumerate(order)])
+    t["all_atom_positions"] = t["all_atom_positions"][order_ind]
+    t["aatype"] = t["aatype"][order_ind]
+    t["asym_id"] = new_asym_id
+    return t
+
+t = transpose_chains(t, (1,0,3,2)) 
+
+embeddings_new = {
+    "aatype": embeddings["aatype"][crop],
+    "seq_mask": mask[crop],
+    "pair": embeddings["pair"][crop, :, :][:, crop, :],
+    "single":  embeddings["single"][crop, :],
+    "final_atom_mask": (mask[..., None]* embeddings["final_atom_mask"])[crop, :],
+    "final_atom_positions":embeddings["final_atom_positions"][crop, :,:],
+    "residx_atom37_to_atom14":embeddings["residx_atom37_to_atom14"][crop, :],
+    "residx_atom14_to_atom37":embeddings["residx_atom14_to_atom37"][crop, :],
+    "atom37_atom_exists":embeddings["atom37_atom_exists"][crop, :],
+    "atom14_atom_exists":embeddings["atom14_atom_exists"][crop, :],
+    "residue_index": embeddings["residue_index"][crop],
+    "asym_id":  embeddings["asym_id"][crop],
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import os
+from openfold.data import mmcif_parsing
+from openfold.data.data_pipeline import add_assembly_features, make_sequence_features, convert_monomer_features
+from openfold.data.data_pipeline import  DataPipelineMultimer, DataPipeline
+from dataclasses import replace
+
+data_processor = DataPipelineMultimer(DataPipeline(None))
+mmcif_file="/home/vuillemr/flexfold/data/cryofold/cryobench_IgD/1HZH.cif"
+with open(mmcif_file, 'r') as f:
+    mmcif_string = f.read()
+
+mmcif_object = mmcif_parsing.parse(
+    file_id="1HZH", mmcif_string=mmcif_string
+)
+mmcif_object = mmcif_object.mmcif_object
+
+dir(mmcif_object)
+
+print(mmcif_object.chain_to_seqres)
+print(mmcif_object.file_id)
+print(mmcif_object.seqres_to_structure)
+print(mmcif_object.structure)
+print(mmcif_object.raw_string)
+
+mmcif_object =replace(mmcif_object,raw_string = "")
+mmcif_object =replace(mmcif_object,header = {"resolution":1.0, "release_date":"01/10/2025"})
+
+
+all_chain_features = {}
+for chain_id, seq in mmcif_object.chain_to_seqres.items():
+    desc= "_".join([mmcif_object.file_id, chain_id])
+    input_sequence = mmcif_object.chain_to_seqres[chain_id]
+    num_res = len(input_sequence)
+
+    mmcif_feats = {}
+
+    mmcif_feats.update(
+        make_sequence_features(
+            sequence=input_sequence,
+            description=desc,
+            num_res=num_res,
+        )
+    )
+    mmcif_feats.update(data_processor.get_mmcif_features(mmcif_object, chain_id))
+
+    mmcif_feats = convert_monomer_features(
+        mmcif_feats,
+        chain_id=desc
+    )
+
+    all_chain_features[desc] = mmcif_feats
+
+all_chain_features = add_assembly_features(all_chain_features)
+
+merge_feats = {}
+for f in ["asym_id","all_atom_positions","all_atom_mask","residue_index","aatype"]:
+    merge_feats[f] = np.concatenate([v[f] for k,v in all_chain_features.items()], axis=0)
+
+
+
+##### PDB #####
+import collections
+import dataclasses
+import functools
+import io
+import json
+import logging
+import os
+from typing import Any, Mapping, Optional, Sequence, Tuple
+
+from Bio import PDB
+from Bio.Data import PDBData
+import numpy as np
+from Bio.PDB import PDBParser
+from collections import defaultdict
+from openfold.data.errors import MultipleChainsError
+import openfold.np.residue_constants as residue_constants
+from openfold.data.mmcif_parsing import _get_first_model, _get_header, _get_protein_chains, ResidueAtPosition, ResiduePosition, MmcifObject, ParsingResult
+from Bio.PDB import PDBParser, PPBuilder
+
+def parse_pdb(pdb_string):
+    parser = PDB.PDBParser(QUIET=True)
+    handle = io.StringIO(pdb_string)
+    full_structure = parser.get_structure("", handle)
+    first_model_structure = _get_first_model(full_structure)
+
+    def pdb_chain_sequences(structure):  
+        ppb = PPBuilder()
+        chain_seqs = {}
+        for chain in structure:
+            seq = ""
+            for pp in ppb.build_peptides(chain):
+                seq += str(pp.get_sequence())  # concatenate fragments
+            if len(seq)>= 1:
+                chain_seqs[chain.id] = seq
+        
+        return chain_seqs
+
+    def build_residue_dict(structure):
+        chain_residues = defaultdict(dict)
+        for chain in structure:
+            chain_id = chain.id
+
+            # Extract residues (ignore hetero/water unless desired)
+            residues = [res for res in chain.get_residues() if res.id[0] == " "]
+            if not residues:
+                continue
+
+            # Just linear counter 0..N-1
+            for idx, res in enumerate(residues):
+                resnum = res.id[1]
+                icode = res.id[2].strip() if res.id[2] != " " else " "
+                hetflag = res.id[0]
+
+                pos = ResiduePosition(chain_id=chain_id,
+                                        residue_number=resnum,
+                                        insertion_code=icode)
+                chain_residues[chain_id][idx] = ResidueAtPosition(
+                    position=pos,
+                    name=res.get_resname(),
+                    is_missing=False,
+                    hetflag=hetflag,
+                )
+        return dict(chain_residues)
+    
+    def assert_residue_order(res_dict):
+        for chain_id, residues in res_dict.items():
+            prev_num, prev_icode = None, " "
+            for idx in sorted(map(int, residues.keys())):
+                pos = residues[idx].position
+                num, icode = pos.residue_number, pos.insertion_code
+
+                if prev_num is not None:
+                    # Ensure strictly increasing residue numbers (or same num with insertion code ordering)
+                    assert (num > prev_num) or (num == prev_num and icode > prev_icode), \
+                        f"Residues out of order in chain {chain_id} at index {idx}: {prev_num}{prev_icode} → {num}{icode}"
+
+                prev_num, prev_icode = num, icode
+
+    chain_seqs = pdb_chain_sequences(first_model_structure)
+    res_dict = build_residue_dict(first_model_structure)
+    assert_residue_order(res_dict)
+
+    mmcif_object = MmcifObject(
+        file_id="",
+        header={"resolution":1.0, "release_date":"01/10/2025"},
+        structure=first_model_structure,
+        chain_to_seqres=chain_seqs,
+        seqres_to_structure=res_dict,
+        raw_string="",
+    )
+    return ParsingResult(mmcif_object=mmcif_object, errors=None)
+
+pdb_file="/home/vuillemr/flexfold/data/cryofold/jillsData/particles/../MEK1DDGRA_ERK2T185V_ADP_AF3_refined_019.pdb"
+# pdb_file="/home/vuillemr/flexfold/data/cryofold/cryobench_IgD/1HZH.pdb"
+with open(pdb_file, 'r') as f:
+    pdb_string = f.read()
+
+mmcif_object = parse_pdb(pdb_string)
+mmcif_object = mmcif_object.mmcif_object
+
+all_chain_features = {}
+for chain_id, seq in mmcif_object.chain_to_seqres.items():
+    desc= "_".join([mmcif_object.file_id, chain_id])
+    input_sequence = mmcif_object.chain_to_seqres[chain_id]
+    num_res = len(input_sequence)
+
+    mmcif_feats = {}
+
+    mmcif_feats.update(
+        make_sequence_features(
+            sequence=input_sequence,
+            description=desc,
+            num_res=num_res,
+        )
+    )
+    mmcif_feats.update(data_processor.get_mmcif_features(mmcif_object, chain_id))
+
+    mmcif_feats = convert_monomer_features(
+        mmcif_feats,
+        chain_id=desc
+    )
+
+    all_chain_features[desc] = mmcif_feats
+
+all_chain_features = add_assembly_features(all_chain_features)
+
+merge_feats = {}
+for f in ["asym_id","all_atom_positions","all_atom_mask","residue_index","aatype"]:
+    merge_feats[f] = np.concatenate([v[f] for k,v in all_chain_features.items()], axis=0)
+
+
+
+struct = torch.load("/home/vuillemr/flexfold/data/cryofold/jillsData/pred2/embeddings_fixed.pt")
+
+merge_feats["asym_id"].shape
+
+from Bio import pairwise2
+
+def map_sequences(seq1, seq2):
+    # Align seq1 to seq2 (global alignment, penalize gaps to keep structure aligned)
+    alignments = pairwise2.align.globalms(seq1, seq2, 2, -1, -5, -0.5)
+    aln1, aln2, score, start, end = alignments[0]
+
+    mapping = []
+    idx1, idx2 = 0, 0
+
+    for a1, a2 in zip(aln1, aln2):
+        if a1 != "-" and a2 != "-":   # match/mismatch → map index
+            mapping.append( idx2)
+            idx1 += 1
+            idx2 += 1
+        elif a1 != "-" and a2 == "-": # gap in seq2 → no mapping
+            mapping.append(( -1))
+            idx1 += 1
+        elif a1 == "-" and a2 != "-": # gap in seq1 → seq2 advances
+            idx2 += 1
+
+    return mapping
+
+from openfold.np import residue_constants as rc
+from openfold.utils.tensor_utils import tensor_tree_map
+
+s1 = merge_feats
+s1 = {k:torch.tensor(v, dtype=torch.long) if np.issubdtype(v.dtype, np.integer) else torch.tensor(v, dtype=torch.float) for k,v in s1.items()}
+
+s2 = struct
+
+
+
+seq1 = "".join([rc.restypes_with_x[i] for i in s1["aatype"]])
+seq2 = "".join([rc.restypes_with_x[i] for i in s2["aatype"]])
+
+mapping = map_sequences(seq1, seq2)
+
+    target_keys = ["asym_id","final_atom_positions","all_atom_mask","residue_index","aatype"]
+    s1_mapped = {k:v.clone() for k,v in {k2:v2 for k2,v2 in s2.items() if k2 in target_keys}.items()}
+    s1_mapped["all_atom_positions"] = s1_mapped["final_atom_positions"]
+    del s1_mapped["final_atom_positions"]
+    for k,v in s1_mapped.items():
+        v[mapping] = s1[k] 
+
+assert all(s1_mapped["aatype"] == s2["aatype"])
+assert all(s1_mapped["asym_id"] == s2["asym_id"])

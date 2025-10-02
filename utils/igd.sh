@@ -11,7 +11,7 @@ python scripts/run_pretrained_openfold.py  ../cryofold/cryobench_IgD/new_preds  
 
 
 BASE_DIR="../cryofold/cryobench_IgD/IgG-1D/images/snr0.01"
-RUN_DIR=$BASE_DIR/run_target_conv
+RUN_DIR=$BASE_DIR/run_target_conv2
 
 python -u ./scripts/train_target.py \
     $BASE_DIR/sorted_particles.128.txt  \
@@ -37,13 +37,33 @@ python -u ./scripts/train_target.py \
     --pair_stack \
     --target_file ~/cryofold/cryobench_IgD/1HZH.cif \
     --overwrite \
+    --frozen_structure_module\
     --multimer \
       --wd 1e-4\
     --lr 5e-4\
-    --warmup 20 \
+    --warmup 100 \
 #     --use_lma \
 
 
 python ./scripts/compute_initial_pose.py $BASE_DIR/initial_pose_conv \
  --from_aligned_pdb data/cryofold/cryobench_IgD/IgG-1D/images/snr0.01/aligned_target_conv.pdb \
  --alignment_reference data//cryofold/cryobench_IgD/IgG-1D/images/snr0.01/run_target_conv/fit.37.pdb  --overwrite
+
+
+
+#*******************CRYODRGN***********************************
+BASE_DIR="../cryofold/cryobench_IgD/IgG-1D/images/snr0.01"
+RUN_DIR=$BASE_DIR/run_cryodrgn
+cryodrgn train_vae     $BASE_DIR/sorted_particles.128.txt  \
+    --poses  $BASE_DIR/particles.pkl\
+    --ctf $BASE_DIR/ctf.pkl \
+    -n 100 \
+    -o $RUN_DIR \
+    --batch-size 1024  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 256 \
+    --enc-layers 3 \
+    --dec-dim 256 \
+    --dec-layers 3 \
+cryodrgn analyze -o $RUN_DIR/analysis $RUN_DIR 99 --pc 2

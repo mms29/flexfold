@@ -26,7 +26,7 @@ import os
 
 from flexfold.lattice import Lattice
 from flexfold.core import (img_ft_lattice, img_ht_lattice, img_real, get_pixel_mask, 
-                            img_real_mask, vol_real_mask, get_voxel_mask, register_crd_to_vol, aatype_to_flat_coefs)
+                            img_real_mask, vol_real_mask, get_voxel_mask, register_crd_to_vol, aatype_to_coefs)
 
 from openfold.utils.import_weights import convert_deprecated_v1_keys
 from openfold.data import data_transforms
@@ -702,6 +702,25 @@ class AFDecoder(torch.nn.Module):
                 target_file, 
                 DataPipelineMultimer(DataPipeline(None)) if is_multimer else DataPipeline(None)
             )
+            # target_feats = transpose_chains(target_feats, (1,0,3,2)) #FIXME
+
+            target_feats = {k:torch.tensor(v, dtype=torch.long) if np.issubdtype(v.dtype, np.integer) else torch.tensor(v, dtype=torch.float) for k,v in target_feats.items()}
+
+            if target_feats["aatype"].shape[0] != embeddings["aatype"].shape[0]:
+                seq1 = "".join([rc.restypes_with_x[i] for i in target_feats["aatype"]])
+                seq2 = "".join([rc.restypes_with_x[i] for i in embeddings["aatype"]])
+
+                mapping = map_sequences(seq1, seq2)
+                if -1 in mapping:
+                    raise NotImplementedError() #FIXME
+                target_keys = ["asym_id","final_atom_positions","all_atom_mask","residue_index","aatype"]
+                target_feats_mapped = {k:v.clone() for k,v in {k2:v2 for k2,v2 in embeddings.items() if k2 in target_keys}.items()}
+                target_feats_mapped["all_atom_positions"] = target_feats_mapped["final_atom_positions"]
+                del target_feats_mapped["final_atom_positions"]
+                for k,v in target_feats_mapped.items():
+                    v[mapping] = target_feats[k] 
+                target_feats = target_feats_mapped
+
             assert all(target_feats["aatype"] == embeddings["aatype"])
             assert all(target_feats["asym_id"] == embeddings["asym_id"])
 
@@ -725,7 +744,7 @@ class AFDecoder(torch.nn.Module):
             embeddings = f(embeddings)
 
         self.embeddings = BufferDict(embeddings)
-        self.register_buffer("atom_coefs", aatype_to_flat_coefs(embeddings["aatype"], embeddings["final_atom_mask"], ca =not self.all_atom))
+        self.register_buffer("atom_coefs", aatype_to_coefs(embeddings["aatype"]))
 
         self.res_size = self.embeddings["pair"].shape[-2]
         self.outdim = self.embeddings["pair"].shape[-1]
@@ -790,7 +809,7 @@ class AFDecoder(torch.nn.Module):
         struct = self.structure_decoder(z)
 
         # Apply initial transform
-        crd = struct_to_crd(struct, ca=not self.all_atom)
+        crd, coefs = struct_to_crd(struct, ca=not self.all_atom, coefs=self.atom_coefs)
         crd = crd @ self.rot_init + self.trans_init[..., None, :]
 
         y_recon = img_ft_lattice(
@@ -798,7 +817,7 @@ class AFDecoder(torch.nn.Module):
             crd_lattice=crd_lattice, 
             sigma = self.sigma, 
             pixel_size=self.pixel_size,
-            coef = self.atom_coefs
+            coef = coefs
         )
         return y_recon, struct
 
@@ -919,7 +938,7 @@ class AFDecoder(torch.nn.Module):
         struct = self.structure_decoder(z)
 
         # Apply initial transform
-        crd = struct_to_crd(struct, not self.all_atom)
+        crd, coefs = struct_to_crd(struct, not self.all_atom, coefs=self.atom_coefs)
         crd = crd @ self.rot_init + self.trans_init[..., None, :]
 
         # vol = vol_real(crd, grid_size = D, sigma = self.sigma, pixel_size=self.pixel_size)
@@ -933,13 +952,13 @@ class AFDecoder(torch.nn.Module):
             D, 
             self.sigma, 
             self.pixel_size,
-            coef = self.atom_coefs
+            coef = coefs
         )
 
         return vol[-1].detach(), struct
     
 
-def struct_to_crd(struct, ca=True):
+def struct_to_crd(struct, ca=True, coefs=None):
     """
     Conversion of coordinates in AF 3-7 format + mask to array of Nx3
     A bit complicated just to apply mask on AF coordinates crd[mask]
@@ -949,8 +968,7 @@ def struct_to_crd(struct, ca=True):
     batch_dim =crd.shape[:-3] 
     if ca:
         crd = crd[..., 1, :]
-        mask = mask[..., 1]
-        crd = (crd[mask == 1.0])
+        crd = (crd[mask[..., 1] == 1.0])
     else:
         flat_idx_shape = batch_dim + (crd.shape[-3]*crd.shape[-2],)
         crd = (crd * mask[..., None]).reshape(flat_idx_shape+(3,))
@@ -958,7 +976,20 @@ def struct_to_crd(struct, ca=True):
     crd = crd.reshape(
         batch_dim + (reduce(operator.mul, crd.shape, 1)//(reduce(operator.mul, batch_dim, 1)*3), 3)
     )
-    return crd
+    if coefs is not None:
+        fmask = mask[-1]
+        if ca:
+            coefs = coefs[fmask[:,1]==1.0].sum(dim=-1)
+        else:
+            n = fmask.shape[-2]
+            flat_idx_shape = (n*37, )
+            coefs = (coefs * fmask).view(flat_idx_shape)
+            coefs = coefs[fmask.view(flat_idx_shape) == 1.0]
+
+        assert all(coefs != 0.0), "Coefs are zeros :%s"% str((coefs==0.0).sum())
+        return crd, coefs
+    else:
+        return crd
 
 class AFDecoderReal(AFDecoder):
     def __init__(self, 
@@ -971,7 +1002,7 @@ class AFDecoderReal(AFDecoder):
         struct = self.structure_decoder(z)
 
         # Apply initial transform
-        crd = struct_to_crd(struct, ca=not self.all_atom)
+        crd, coefs = struct_to_crd(struct, ca=not self.all_atom, coefs = self.atom_coefs)
         crd = crd @ self.rot_init + self.trans_init[..., None, :]
 
         crd = crd @ rot.transpose(-1,-2)
@@ -989,7 +1020,7 @@ class AFDecoderReal(AFDecoder):
             self.lattice_size, 
             self.sigma, 
             self.pixel_size,
-            coef = self.atom_coefs
+            coef = coefs
         )
         y_recon = fft.fft2_center(y_recon_real)
 
@@ -1186,36 +1217,88 @@ def generate_translation_dict_sm(model, version, is_multimer=False):
         }
     return translations
 
+import io
+import os
+from typing import Any, Optional, Sequence, Tuple
+from Bio import PDB
+import numpy as np
+from collections import defaultdict
+from openfold.data.mmcif_parsing import _get_first_model, ResidueAtPosition, ResiduePosition, MmcifObject, ParsingResult
+from Bio.PDB import PPBuilder
+from Bio import pairwise2
 
-from Bio.PDB import PDBParser, MMCIFIO
-from io import StringIO
+def parse_pdb(file_id, pdb_string):
+    parser = PDB.PDBParser(QUIET=True)
+    handle = io.StringIO(pdb_string)
+    full_structure = parser.get_structure("", handle)
+    first_model_structure = _get_first_model(full_structure)
 
+    def pdb_chain_sequences(structure):  
+        ppb = PPBuilder()
+        chain_seqs = {}
+        for chain in structure:
+            seq = ""
+            for pp in ppb.build_peptides(chain):
+                seq += str(pp.get_sequence())  # concatenate fragments
+            if len(seq)>= 1:
+                chain_seqs[chain.id] = seq
+        
+        return chain_seqs
 
-def pdb_string_to_mmcif_string(pdb_str: str) -> str:
-    """
-    Convert a PDB structure given as a string to an MMCIF string.
+    def build_residue_dict(structure):
+        chain_residues = defaultdict(dict)
+        for chain in structure:
+            chain_id = chain.id
 
-    Args:
-        pdb_str: str, contents of a PDB file.
+            # Extract residues (ignore hetero/water unless desired)
+            residues = [res for res in chain.get_residues() if res.id[0] == " "]
+            if not residues:
+                continue
 
-    Returns:
-        mmcif_str: str, MMCIF format as a string.
-    """
-    # Parse PDB from string
-    pdb_io = StringIO(pdb_str)
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure("structure", pdb_io)
+            # Just linear counter 0..N-1
+            for idx, res in enumerate(residues):
+                resnum = res.id[1]
+                icode = res.id[2].strip() if res.id[2] != " " else " "
+                hetflag = res.id[0]
 
-    # Prepare MMCIF writer
-    mmcif_io = MMCIFIO()
-    mmcif_io.set_structure(structure)
+                pos = ResiduePosition(chain_id=chain_id,
+                                        residue_number=resnum,
+                                        insertion_code=icode)
+                chain_residues[chain_id][idx] = ResidueAtPosition(
+                    position=pos,
+                    name=res.get_resname(),
+                    is_missing=False,
+                    hetflag=hetflag,
+                )
+        return dict(chain_residues)
+    
+    def assert_residue_order(res_dict):
+        for chain_id, residues in res_dict.items():
+            prev_num, prev_icode = None, " "
+            for idx in sorted(map(int, residues.keys())):
+                pos = residues[idx].position
+                num, icode = pos.residue_number, pos.insertion_code
 
-    # Save to string buffer
-    buffer = StringIO()
-    mmcif_io.save(buffer)
-    mmcif_str = buffer.getvalue()
-    buffer.close()
-    return mmcif_str
+                if prev_num is not None:
+                    # Ensure strictly increasing residue numbers (or same num with insertion code ordering)
+                    assert (num > prev_num) or (num == prev_num and icode > prev_icode), \
+                        f"Residues out of order in chain {chain_id} at index {idx}: {prev_num}{prev_icode} → {num}{icode}"
+
+                prev_num, prev_icode = num, icode
+
+    chain_seqs = pdb_chain_sequences(first_model_structure)
+    res_dict = build_residue_dict(first_model_structure)
+    assert_residue_order(res_dict)
+
+    mmcif_object = MmcifObject(
+        file_id=file_id,
+        header={"resolution":1.0, "release_date":"01/10/2025"},
+        structure=first_model_structure,
+        chain_to_seqres=chain_seqs,
+        seqres_to_structure=res_dict,
+        raw_string="",
+    )
+    return ParsingResult(mmcif_object=mmcif_object, errors=None)
 
 
 def get_target_feats(mmcif_file,data_processor):
@@ -1225,11 +1308,13 @@ def get_target_feats(mmcif_file,data_processor):
 
     ext = os.path.splitext(mmcif_file)[1].lower()
     if ext in [".pdb"]: 
-        mmcif_string = pdb_string_to_mmcif_string(mmcif_string)
-
-    mmcif_object = mmcif_parsing.parse(
-        file_id="1HZH", mmcif_string=mmcif_string
-    )
+        mmcif_object = parse_pdb(
+            file_id="1HZH", pdb_string=mmcif_string
+        )
+    else:
+        mmcif_object = mmcif_parsing.parse(
+            file_id="1HZH", mmcif_string=mmcif_string
+        )
 
     # Crash if an error is encountered. Any parsing errors should have
     # been dealt with at the alignment stage.
@@ -1270,6 +1355,37 @@ def get_target_feats(mmcif_file,data_processor):
     return merge_feats
 
 
+def map_sequences(seq1, seq2):
+    # Align seq1 to seq2 (global alignment, penalize gaps to keep structure aligned)
+    alignments = pairwise2.align.globalms(seq1, seq2, 2, -1, -5, -0.5)
+    aln1, aln2, score, start, end = alignments[0]
+
+    mapping = []
+    idx1, idx2 = 0, 0
+
+    for a1, a2 in zip(aln1, aln2):
+        if a1 != "-" and a2 != "-":   # match/mismatch → map index
+            mapping.append( idx2)
+            idx1 += 1
+            idx2 += 1
+        elif a1 != "-" and a2 == "-": # gap in seq2 → no mapping
+            mapping.append(( -1))
+            idx1 += 1
+        elif a1 == "-" and a2 != "-": # gap in seq1 → seq2 advances
+            idx2 += 1
+
+    return mapping
+
+
+def transpose_chains(t, transpose):
+    asym_id = t["asym_id"]
+    order = np.unique(t["asym_id"])[[i for i in transpose]]
+    order_ind = np.concatenate([np.where(asym_id==i)[0] for i in order])
+    new_asym_id = np.concatenate([(i+1)*np.ones((asym_id==o).sum()) for i,o in enumerate(order)])
+    t["all_atom_positions"] = t["all_atom_positions"][order_ind]
+    t["aatype"] = t["aatype"][order_ind]
+    t["asym_id"] = new_asym_id
+    return t
 
 
 

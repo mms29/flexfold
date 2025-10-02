@@ -241,9 +241,9 @@ def img_ft_lattice(crd, crd_lattice, sigma = 1.0, pixel_size=1.0, crd_mask=None,
 
     F = torch.exp(-2j * torch.pi * torch.sum(crd[...,None, :] * crd_lattice[..., None, :,:], dim=-1))
     if crd_mask is not None:
-        F *= crd_mask[..., None]
+        F = F * crd_mask[..., None]
     if coef is not None:
-        F *= coef[..., None]
+        F = F * coef[..., None]
         
     F = torch.sum(F, dim=-2)
 
@@ -487,29 +487,15 @@ def aatype_to_coefs(aatype):
     n = aatype.shape[-1]
     coef37 = aatype.new_zeros((n, 37))
 
-    for i in range(aatype.shape[-1]):
-        coef37[i][rc.RESTYPE_ATOM14_TO_ATOM37[aatype[i]]] =  torch.tensor( 
-            atom_name_to_coef(aatype_to_14_names(aatype[i]))
-        , device=aatype.device, dtype=aatype.dtype
-        )
+    for a in range(aatype.shape[-1]):
+        coef_i = atom_name_to_coef(aatype_to_14_names(aatype[a]))
+        ind_i =  rc.RESTYPE_ATOM14_TO_ATOM37[aatype[a]]
+        zero_ind=False
+        for c, i in zip(coef_i, ind_i):
+            if i==0 and zero_ind:
+                break
+            elif i==0:
+                zero_ind=True
+            coef37[a,i] = c 
+            
     return coef37
-
-def aatype_to_flat_coefs(aatype, mask, ca=True):
-
-    coefs = aatype_to_coefs(aatype)
-    n = aatype.shape[-1]
-
-    assert ( ((coefs ==0.0) * (mask==0.0)).sum() == (mask==0.0).sum() )
-    # assert ( ((coefs !=0.0) * (mask==1.0)).sum() == (mask==1.0).sum() )
-
-
-    if ca:
-        coefs = coefs[mask[...,1]==1.0].sum(dim=-1)
-    else:
-        flat_idx_shape = (n*37, )
-        coefs = (coefs * mask).view(flat_idx_shape)
-        coefs = coefs[mask.view(flat_idx_shape) == 1.0]
-
-    assert all(coefs != 0.0)
-
-    return coefs

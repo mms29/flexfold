@@ -94,7 +94,7 @@ class LitTarget(LitHetOnlyVAE):
         # Scheduler step
         sch.step()
         
-        if self.global_step %25 == 0:
+        if self.global_step %100 == 0:
             if self.trainer.is_global_zero:
                 logger.info("Writing checkpoint at step %s ..."%self.global_step)
                 out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)

@@ -103,15 +103,15 @@ def print_model_summary(model):
     logger.info(f"Encoder params      : {encoder_param:,}")
     logger.info(f"{'='*50}")
 
-    for k,v in detail.items():
-        logger.info("%s \t\t-> %.2f"%(k,v/1e6))
+    # for k,v in detail.items():
+    #     logger.info("%s \t\t-> %.2f"%(k,v/1e6))
 
-    print("PARAMS-----------")
-    for name, p in model.posetracker.named_parameters():
-        print(name)
-    print("PARAMS-----------")
-    for name, p in model.model.named_parameters():
-        print(name)
+    # # print("PARAMS-----------")
+    # for name, p in model.posetracker.named_parameters():
+    #     print(name)
+    # print("PARAMS-----------")
+    # for name, p in model.model.named_parameters():
+    #     print(name)
 
 
 logger = logging.getLogger(__name__)
@@ -719,7 +719,7 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         return y, y_real, rot, tran, c
     
-    def write_debug(self, struct, mask, y, y_real, y_recon, y_recon_real, global_it):
+    def write_debug(self, struct, mask, y, y_real, y_recon, y_recon_real, global_it, sigma=1.0):
         """
         y : ?
         y_real :[B, D-1, D-1] Real
@@ -743,8 +743,6 @@ class LitHetOnlyVAE(pl.LightningModule):
             #filter
             y_ = y_real[i].detach().cpu().numpy()
             r_ = y_recon_real[i].detach().cpu().numpy()
-
-            sigma = 1.5
             y_ = gaussian_filter(y_, sigma=sigma)
             r_ = gaussian_filter(r_, sigma=sigma)
             # Normalize
