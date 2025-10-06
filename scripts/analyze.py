@@ -538,17 +538,19 @@ def plot_loss(infile, outfile):
     ) / np.convolve(~np.isnan(arr), np.ones(w), 'valid')
     movavg_step = lambda arr,w: arr[:-(w-1)]*(len(arr)/(len(arr)-w))
 
-    losses=["data_loss", "chi_loss", "viol_loss","pose_rot", "kld", "loss"]
+    losses=["data_loss", "chi_loss", "viol_loss","pose_rot", "kld", "loss", "scale_loss"]
     col = "tab:blue"
     valcol = "tab:green"
     nrows = 2
-    ncols=3
-    fig, ax = plt.subplots(nrows,ncols, figsize=(10,5), layout="constrained")
+    ncols=4
+    fig, ax = plt.subplots(nrows,ncols, figsize=(20,10), layout="constrained")
     for x in range(nrows):
         for y in range(ncols):
             ii = x *ncols + y
             if ii>=len(losses):
                 break
+
+            print(losses[ii])
 
             if not losses[ii]+"_step" in train_step:
                 break

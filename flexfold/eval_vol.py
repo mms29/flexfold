@@ -229,8 +229,15 @@ def main(args: argparse.Namespace) -> None:
                 crd = output["final_atom_positions"]
                 crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
 
+                b_factors = getattr(model.decoder,"coef_scale", None)
+                if b_factors is not None:
+                    b_factors= b_factors[:,None].expand(-1, 37)
+                    b_factors = (b_factors**2).detach().cpu().numpy()
+                    print(b_factors)
+
                 output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
-                   out_pdb, chain_index=output["asym_id"] if "asym_id" in output else None, residue_index=output["residue_index"])
+                   out_pdb, chain_index=output["asym_id"] if "asym_id" in output else None, residue_index=output["residue_index"],
+                   b_factors=b_factors )
 
             else:
                 if args.downsample:
@@ -280,8 +287,15 @@ def main(args: argparse.Namespace) -> None:
             output = tensor_tree_map(lambda x: np.array(x[-1].detach().cpu()), output)
             crd = output["final_atom_positions"]
             crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
+
+            b_factors = getattr(model.decoder,"coef_scale", None)
+            if b_factors is not None:
+                b_factors= b_factors[:,None].expand(-1, 37)
+                b_factors = (b_factors**2).detach().cpu().numpy()
+
             output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
-                out_pdb , chain_index=output["asym_id"], residue_index=output["residue_index"])
+                out_pdb , chain_index=output["asym_id"], residue_index=output["residue_index"],
+                b_factors=b_factors)
                 
         if not args.no_volume: 
             if args.flip:

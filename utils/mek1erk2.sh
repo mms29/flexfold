@@ -69,13 +69,12 @@ python -u ./scripts/train_target.py \
     --domain real \
     --encode-mode conv \
     --pair_stack \
-    --frozen_structure_module \
     --target_file $BASE_DIR/../MEK1DDGRA_ERK2T185V_ADP_AF3_refined_019.pdb \
     --overwrite \
     --multimer \
       --wd 1e-4\
     --lr 5e-4\
-    --warmup 20 
+    --warmup 100 
 
 
 python ~/flexfold//scripts/train.py $BASE_DIR/particles_downsampled.mrcs  \
@@ -107,48 +106,41 @@ python ~/flexfold//scripts/train.py $BASE_DIR/particles_downsampled.mrcs  \
     --warmup 100 \
     --debug \
 
-python ~/flexfold//scripts/train.py $BASE_DIR/particles_downsampled.mrcs  \
+
+python ~/flexfold/scripts/compute_initial_pose.py $BASE_DIR/initial_pose_target \
+ --from_aligned_pdb  $BASE_DIR/aligned_target_fit1.pdb \
+ --alignment_reference  $BASE_DIR/run_target/fit.1.pdb   \
+  --overwrite
+
+python -u ./scripts/train_target.py \
+    $BASE_DIR/particles_ctf.star  \
     --poses $BASE_DIR/particles.pkl \
     --ctf $BASE_DIR/ctf.pkl \
-    -n 100 \
+    -n 10000 \
     -o $RUN_DIR \
-    --pixel_size 1.58 \
-    --sigma 1.05 \
+    --pixel_size 3.0 \
+    --sigma 1.05\
     --quality_ratio 5.0 \
-    --embedding_path data/cryofold/jillsData/pred2/embeddings_fixed.pt \
-    --initial_pose_path $BASE_DIR/initial_pose.pt \
-    --af_checkpoint_path ../openfold/openfold/resources/params/params_model_1_multimer_v3.npz \
-    --batch-size 2  \
+    --embedding_path data/cryofold/jillsData/pred2/embeddings_fixed.pt   \
+    --initial_pose_path $BASE_DIR/initial_pose_target.pt \
+    --af_checkpoint_path  ../openfold/openfold/resources/params/params_model_1_multimer_v3.npz \
+    --batch-size 1  \
     --num-workers 0 \
     --zdim 4  \
-    --enc-dim 64 \
+    --enc-dim 32 \
     --enc-layers 5 \
+    --dec-dim 32 \
+    --dec-layers 4 \
     --domain real \
     --encode-mode conv \
-    --dec-dim 64 \
-    --dec-layers 3 \
-    --all_atom\
-    --overwrite\
-    --multimer\
-    --frozen_structure_module\
-    --pair_stack\
-    --debug\
+    --pair_stack \
+    --load $BASE_DIR/run_target/weights.1.pkl\
+    --overwrite \
+    --multimer \
+    --wd 1e-4\
+    --lr 5e-4\
+    --warmup 100 \ 
+    --debug
+
 
 BASE_DIR="/home/vuillemr/flexfold/data/cryofold/jillsData/particles"
-RUN_DIR=$BASE_DIR/run_cryodrgn
-
-cryodrgn train_vae $BASE_DIR/particles_downsampled.mrcs  \
-    --poses $BASE_DIR/particles.pkl \
-    --ctf $BASE_DIR/ctf.pkl \
-    -n 100 \
-    -o $RUN_DIR \
-    --batch-size 1024  \
-    --num-workers 0 \
-    --zdim 4  \
-    --enc-dim 256 \
-    --enc-layers 3 \
-    --dec-dim 256 \
-    --dec-layers 3 \
-
-
-cryodrgn analyze  -o $RUN_DIR/analysis $RUN_DIR 64 --pc 2

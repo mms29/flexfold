@@ -62,6 +62,7 @@ from pytorch_lightning.strategies import DDPStrategy
 from scipy.ndimage import gaussian_filter
 from flexfold.core import ifft2_center, unsymmetrize_ht, rotmat_angle_deg
 from torch.optim.lr_scheduler import LambdaLR
+from flexfold.lora import apply_lora_config_to_model
 
 def pad_to_max(tensor, max_size):
     pad_size = max_size - tensor.size(0)
@@ -163,7 +164,7 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         "--data_loss_weight", type=float, default=1.0, help="TODO"
     )    
     parser.add_argument(
-        "--center_loss_weight", type=float, default=0.01, help="TODO"
+        "--scale_loss_weight", type=float, default=0.1, help="TODO"
     )
     parser.add_argument(
         "--viol_loss_weight", type=float, default=1.0, help="TODO"
@@ -201,6 +202,9 @@ def add_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--frozen_structure_module", action="store_true", help="TODO"
+    )
+    parser.add_argument(
+        "--lora_structure_module", action="store_true", help="TODO"
     )
     parser.add_argument(
         "--poses", type=os.path.abspath, required=True, help="Image poses (.pkl)"
@@ -651,6 +655,9 @@ class LitHetOnlyVAE(pl.LightningModule):
             for param in self.model.decoder.structure_module.parameters():
                 param.requires_grad = False
 
+        if self.args.lora_structure_module:
+            self.model = apply_lora_config_to_model(self.model)
+
         if self.domain == "real":
             self.model.enc_mask = None
 
@@ -995,24 +1002,28 @@ class LitHetOnlyVAE(pl.LightningModule):
                     **{**struct, **self.model.decoder.loss_config.supervised_chi},
                 )
                 
+        # Scale loss
+        scale_loss = (self.model.decoder.coef_scale ** 2).sum()
+
         # Center Loss
         # crd = struct_to_crd(struct, ca=not self.model.decoder.all_atom)
         # crd = crd @ self.model.decoder.rot_init + self.model.decoder.trans_init[..., None, :]
         # center_loss = torch.mean(torch.sum((torch.mean(crd, dim=-2) ** 2 ), dim=-1))
-        center_loss = 0.0
+        # center_loss = 0.0
 
         # TOTAL GEN LOSS
         gen_loss = {
             "data_loss": data_loss, 
             "chi_loss" : chi_loss, 
             "viol_loss": viol_loss,
-            "center_loss": center_loss,
+            # "center_loss": center_loss,
+            "scale_loss": scale_loss,
             }
         total_gen_loss = (
             data_loss * self.args.data_loss_weight + 
             chi_loss * self.args.chi_loss_weight +
             viol_loss * self.args.viol_loss_weight +
-            center_loss * self.args.center_loss_weight
+            scale_loss * self.args.scale_loss_weight
         )
         return gen_loss, total_gen_loss
 

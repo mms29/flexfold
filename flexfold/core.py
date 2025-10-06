@@ -13,11 +13,12 @@ from cryodrgn.fft import fftshift
 from torch.fft import ifft2
 import  openfold.np.residue_constants as rc
 
-def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file, chain_index=None, residue_index=None):
+def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file, chain_index=None, residue_index=None, b_factors=None):
 
     if chain_index is None:
         chain_index = np.zeros_like(aatype)
-    b_factors = np.zeros_like(all_atom_mask)
+    if b_factors is None:
+        b_factors = np.zeros_like(all_atom_mask)
     if residue_index is None:
         residue_index = np.arange(len(aatype))+1
 

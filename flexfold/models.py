@@ -46,7 +46,21 @@ from typing import Any, Tuple, List, Callable, Optional
 import torch
 import torch.utils.checkpoint
 
-
+NUM_RES = "num residues placeholder"
+embeddings_keys = {
+    "aatype": [NUM_RES],
+    "seq_mask": [NUM_RES],
+    "pair": [NUM_RES, NUM_RES, None],
+    "single": [NUM_RES, None],
+    "final_atom_mask":[NUM_RES, None],
+    "final_atom_positions":[NUM_RES,None, None],
+    "residx_atom37_to_atom14":[NUM_RES, None],
+    "residx_atom14_to_atom37":[NUM_RES, None],
+    "atom37_atom_exists":[NUM_RES, None],
+    "atom14_atom_exists":[NUM_RES, None],
+    "residue_index":[NUM_RES],
+    "asym_id": [NUM_RES],
+}
 
 class HetOnlyVAE(nn.Module):
     # No pose inference
@@ -658,12 +672,6 @@ class AFDecoder(torch.nn.Module):
         self.globals = config.globals
         self.config = config.model
         self.loss_config = config.loss
-
-        self.structure_module = StructureModule(
-            is_multimer=is_multimer,
-            **self.config["structure_module"],
-        )
-
         self.pixel_size=pixel_size
         self.sigma = sigma
         self.lattice_size=lattice_size
@@ -672,64 +680,22 @@ class AFDecoder(torch.nn.Module):
         self.target_file=target_file
         self.domain = domain
         self.is_multimer=is_multimer
+        self.zdim = zdim
+        self.hidden_dim=hidden_dim
 
-        self.register_buffer("rot_init", rot_init)
-        self.register_buffer("trans_init", trans_init)
-
-        NUM_RES = "num residues placeholder"
-
-        # self.embeddings = embeddings
-        embeddings_keys = {
-            "aatype": [NUM_RES],
-            "seq_mask": [NUM_RES],
-            "pair": [NUM_RES, NUM_RES, None],
-            "single": [NUM_RES, None],
-            "final_atom_mask":[NUM_RES, None],
-            "final_atom_positions":[NUM_RES,None, None],
-            "residx_atom37_to_atom14":[NUM_RES, None],
-            "residx_atom14_to_atom37":[NUM_RES, None],
-            "atom37_atom_exists":[NUM_RES, None],
-            "atom14_atom_exists":[NUM_RES, None],
-            "residue_index":[NUM_RES],
-            "asym_id": [NUM_RES],
-        }
-    
-
+        # filter embeddings to the keys needed
         embeddings = {k: v for k, v in embeddings.items() if k in embeddings_keys.keys()}
 
+        # Read target file if needed
         if target_file is not None:
-            target_feats = get_target_feats(
-                target_file, 
-                DataPipelineMultimer(DataPipeline(None)) if is_multimer else DataPipeline(None)
-            )
-            # target_feats = transpose_chains(target_feats, (1,0,3,2)) #FIXME
-
-            target_feats = {k:torch.tensor(v, dtype=torch.long) if np.issubdtype(v.dtype, np.integer) else torch.tensor(v, dtype=torch.float) for k,v in target_feats.items()}
-
-            if target_feats["aatype"].shape[0] != embeddings["aatype"].shape[0]:
-                seq1 = "".join([rc.restypes_with_x[i] for i in target_feats["aatype"]])
-                seq2 = "".join([rc.restypes_with_x[i] for i in embeddings["aatype"]])
-
-                mapping = map_sequences(seq1, seq2)
-                if -1 in mapping:
-                    raise NotImplementedError() #FIXME
-                target_keys = ["asym_id","final_atom_positions","all_atom_mask","residue_index","aatype"]
-                target_feats_mapped = {k:v.clone() for k,v in {k2:v2 for k2,v2 in embeddings.items() if k2 in target_keys}.items()}
-                target_feats_mapped["all_atom_positions"] = target_feats_mapped["final_atom_positions"]
-                del target_feats_mapped["final_atom_positions"]
-                for k,v in target_feats_mapped.items():
-                    v[mapping] = target_feats[k] 
-                target_feats = target_feats_mapped
-
-            assert all(target_feats["aatype"] == embeddings["aatype"])
-            assert all(target_feats["asym_id"] == embeddings["asym_id"])
+            target_feats = get_target_feats(target_file, self.is_multimer)
 
 
+        # Convert embedding to features
         def make_gt(feats):
-            feats["all_atom_positions"] = torch.tensor(target_feats ["all_atom_positions"]) if target_file is not None else feats["final_atom_positions"] 
+            feats["all_atom_positions"] = target_feats ["all_atom_positions"] if target_file is not None else feats["final_atom_positions"] 
             feats["all_atom_mask"] = feats["final_atom_mask"] 
             return feats
-    
         fc = [
             # data_transforms.make_fixed_size(embeddings_keys,0,0,500,0),
             make_gt,
@@ -743,75 +709,61 @@ class AFDecoder(torch.nn.Module):
         for f in fc:
             embeddings = f(embeddings)
 
+        # Register embeddings as buffers
         self.embeddings = BufferDict(embeddings)
-        self.register_buffer("atom_coefs", aatype_to_coefs(embeddings["aatype"]))
-
         self.res_size = self.embeddings["pair"].shape[-2]
         self.outdim = self.embeddings["pair"].shape[-1]
 
-        self.zdim = zdim
-        self.hidden_dim=hidden_dim
+        # Initial alignement, atom coef always constant 
+        self.register_buffer("rot_init", rot_init)
+        self.register_buffer("trans_init", trans_init)
+        self.register_buffer("atom_coefs", aatype_to_coefs(embeddings["aatype"]))
 
-        self.new=True
-
+        # DECODER
         if self.pair_stack : 
-            if self.new:
-                self.no_latent = 4
-                self.linear_z = Linear(self.zdim, self.no_latent*self.zdim)
+            self.no_latent = 4
+            self.linear_z = Linear(self.zdim, self.no_latent*self.zdim)
 
-                self.decoder_ = CryoFormerStack(
-                    c_z=self.outdim,
-                    c_latent=self.zdim,
-                    c_hidden=self.hidden_dim,
-                    c_hidden_mul=128,
-                    c_hidden_bias=32,
-                    no_heads=4,
-                    no_blocks=layers,
-                    transition_n=2,
-                    dropout_rate=0.15,
-                    blocks_per_ckpt=1
-                )
-                # self.embeddings["pair"].requires_grad = True
-                # self.embeddings["seq_mask"].requires_grad = True
-            else:
-                self.input_proj = Linear(zdim, hidden_dim )
-                self.embedding_proj = Linear(self.outdim, hidden_dim )
-                self.decoder_ = TemplatePairStack(
-                        c_t=hidden_dim,
-                        c_hidden_tri_att= hidden_dim//4,
-                        c_hidden_tri_mul= hidden_dim//2,
-                        no_blocks= layers,
-                        no_heads= 4,
-                        pair_transition_n= layers,
-                        dropout_rate= 0.15,
-                        tri_mul_first=False,
-                        fuse_projection_weights= False,
-                        blocks_per_ckpt =1,
-                        tune_chunk_size=False
-                )
-                self.output_proj = Linear(hidden_dim, self.outdim )
-
-
+            self.decoder_ = CryoFormerStack(
+                c_z=self.outdim,
+                c_latent=self.zdim,
+                c_hidden=self.hidden_dim,
+                c_hidden_mul=128,
+                c_hidden_bias=32,
+                no_heads=4,
+                no_blocks=layers,
+                transition_n=2,
+                dropout_rate=0.15,
+                blocks_per_ckpt=1
+            )
         else:
             self.decoder_ = ResidLinearMLP(zdim, layers, hidden_dim, self.outdim, activation)
 
         self.n_pix_cutoff=int(np.ceil(quality_ratio * self.sigma / self.pixel_size) * 2 + 1)    
+    
+        # Structure module decoder
+        self.structure_module = StructureModule(
+            is_multimer=is_multimer,
+            **self.config["structure_module"],
+        )
 
+        self.coef_scale = nn.Parameter(torch.zeros(self.res_size))
 
-        print("--\n AF DECODER PARAMETERS :")
-        print("\t mode : %s"%("real space" if isinstance(self, AFDecoderReal) else "reciprocal"))
-        print("\t domain : %s"%(domain))
-        print("\t pair_stack : %s"%str(pair_stack))
-        print("\t integration diameter set to %i"%((self.n_pix_cutoff)))
-        print("--\n")
-        
     def forward(self, crd_lattice, z):
+
+        # Latent to structure
         struct = self.structure_decoder(z)
 
-        # Apply initial transform
-        crd, coefs = struct_to_crd(struct, ca=not self.all_atom, coefs=self.atom_coefs)
+        # [N, 37]
+        coefs = torch.exp(self.coef_scale)[:, None] * self.atom_coefs
+
+        # structure to coordinates
+        crd, coefs = struct_to_crd(struct, ca=not self.all_atom, coefs=coefs)
+
+        # Apply initial transformation
         crd = crd @ self.rot_init + self.trans_init[..., None, :]
 
+        # Reconstruct image
         y_recon = img_ft_lattice(
             crd=crd, 
             crd_lattice=crd_lattice, 
@@ -823,9 +775,9 @@ class AFDecoder(torch.nn.Module):
 
     def structure_decoder(self, z):
         # inplace_safe = not (self.training or torch.is_grad_enabled())
-        inplace_safe = False #TODO
+        inplace_safe = False #FIXME
 
-
+        # expand embeddings to the batch dimension #FIXME
         batch_dim = z.shape[:-1]
         embedding_expand = {
             k: v.unsqueeze(0).expand(batch_dim+ tuple(-1 for _ in v.shape)) for k, v in self.embeddings.items()
@@ -834,46 +786,15 @@ class AFDecoder(torch.nn.Module):
         if self.pair_stack : 
             pos_mask = embedding_expand["seq_mask"]
             pair_mask = pos_mask[..., None] * pos_mask[..., None, :]
-            if self.new:
 
-                latent = self.linear_z(z).view( batch_dim+(self.no_latent ,z.shape[-1]))
+            latent = self.linear_z(z).view( batch_dim+(self.no_latent ,z.shape[-1]))
 
-                pair_update = self.decoder_(
-                        z=embedding_expand["pair"],
-                        latent=latent[..., None, :, :],
-                        mask=pair_mask
-                )
-            else:
-
-                #[B, 1, zdim]
-                pair_update = self.input_proj(z)
-
-                # [B, N, N, hidden_dim]
-                pair_update = pair_update.unsqueeze(-2).repeat(1, self.res_size **2, 1) 
-                pair_update = pair_update.reshape(batch_dim + (self.res_size, self.res_size, self.hidden_dim))
-
-                # [B, N, N, hidden_dim]
-                embedding_update = self.embedding_proj(embedding_expand["pair"])
-                pair_update = add(embedding_update, pair_update, inplace_safe)
-
-                # [B, N, N, hidden_dim]
-                pair_update = self.decoder_(
-                    pair_update[..., None, :,:,:],
-                    mask=pair_mask[..., None, :,:],
-                    chunk_size=self.globals.chunk_size,
-                    use_deepspeed_evo_attention=self.globals.use_deepspeed_evo_attention,
-                    use_lma=self.globals.use_lma,
-                    # use_flash=self.globals.use_flash,
-                    inplace_safe=not (self.training or torch.is_grad_enabled()),
-                    _mask_trans=self.config._mask_trans,
-                )
-
-
-                # [B, N, N, outdim]
-                pair_update =self.output_proj(pair_update[..., -1, :, :, :])
-                pair_update = add(embedding_expand["pair"], pair_update, inplace_safe)
-
-
+            # [*, N, N, Pdim]
+            pair_update = self.decoder_(
+                    z=embedding_expand["pair"],
+                    latent=latent[..., None, :, :],
+                    mask=pair_mask
+            )
         else:
             # [*, N**2, Zdim]
             pair_update = z.unsqueeze(-2).repeat(1, self.res_size **2, 1) 
@@ -891,7 +812,7 @@ class AFDecoder(torch.nn.Module):
             "single": embedding_expand["single"]
         }
 
-                # Predict 3D structure
+        # Predict 3D structure
         outputs = {}
         outputs["sm"] = self.structure_module(
             structure_input,
@@ -1301,11 +1222,16 @@ def parse_pdb(file_id, pdb_string):
     return ParsingResult(mmcif_object=mmcif_object, errors=None)
 
 
-def get_target_feats(mmcif_file,data_processor):
+def get_target_feats(mmcif_file, embeddings, is_multimer=False):
 
+    # Dummy dataprocessor
+    data_processor = DataPipelineMultimer(DataPipeline(None)) if is_multimer else DataPipeline(None)
+
+    # Read PDB/MMCIF string
     with open(mmcif_file, 'r') as f:
         mmcif_string = f.read()
 
+    # Parse
     ext = os.path.splitext(mmcif_file)[1].lower()
     if ext in [".pdb"]: 
         mmcif_object = parse_pdb(
@@ -1323,6 +1249,7 @@ def get_target_feats(mmcif_file,data_processor):
 
     mmcif_object = mmcif_object.mmcif_object
 
+    # Merge multimer features 
     all_chain_features = {}
     for chain_id, seq in mmcif_object.chain_to_seqres.items():
         desc= "_".join([mmcif_object.file_id, chain_id])
@@ -1349,10 +1276,35 @@ def get_target_feats(mmcif_file,data_processor):
 
     all_chain_features = add_assembly_features(all_chain_features)
 
-    merge_feats = {}
-    for f in ["asym_id","all_atom_positions","all_atom_mask","residue_index","aatype"]:
-        merge_feats[f] = np.concatenate([v[f] for k,v in all_chain_features.items()], axis=0)
-    return merge_feats
+    # Keep only the target features 
+    target_keys = ["asym_id","final_atom_positions","all_atom_mask","residue_index","aatype"]
+    target_feats = {}
+    for f in target_keys:
+        target_feats[f] = np.concatenate([v[f] for k,v in all_chain_features.items()], axis=0)
+
+    # Convert to tensor
+    target_feats = {k:torch.tensor(v, dtype=torch.long) if np.issubdtype(v.dtype, np.integer) else torch.tensor(v, dtype=torch.float) for k,v in target_feats.items()}
+
+    # Align target to embedding if needed
+    if target_feats["aatype"].shape[0] != embeddings["aatype"].shape[0]:
+        seq1 = "".join([rc.restypes_with_x[i] for i in target_feats["aatype"]])
+        seq2 = "".join([rc.restypes_with_x[i] for i in embeddings["aatype"]])
+
+        mapping = map_sequences(seq1, seq2)
+        if -1 in mapping:
+            raise NotImplementedError() #FIXME
+        target_feats_mapped = {k:v.clone() for k,v in {k2:v2 for k2,v2 in embeddings.items() if k2 in target_keys}.items()}
+        target_feats_mapped["all_atom_positions"] = target_feats_mapped["final_atom_positions"]
+        del target_feats_mapped["final_atom_positions"]
+        for k,v in target_feats_mapped.items():
+            v[mapping] = target_feats[k] 
+        target_feats = target_feats_mapped
+
+    # Final assertions
+    assert all(target_feats["aatype"] == embeddings["aatype"])
+    assert all(target_feats["asym_id"] == embeddings["asym_id"])
+
+    return target_feats
 
 
 def map_sequences(seq1, seq2):
