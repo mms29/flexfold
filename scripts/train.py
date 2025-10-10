@@ -62,7 +62,7 @@ from pytorch_lightning.strategies import DDPStrategy
 from scipy.ndimage import gaussian_filter
 from flexfold.core import ifft2_center, unsymmetrize_ht, rotmat_angle_deg
 from torch.optim.lr_scheduler import LambdaLR
-from flexfold.lora import apply_lora_config_to_model
+from flexfold.lora import apply_lora_config_to_model, lora_light
 
 def pad_to_max(tensor, max_size):
     pad_size = max_size - tensor.size(0)
@@ -502,6 +502,12 @@ def add_args(parser: argparse.ArgumentParser) -> None:
         help="Volume decoder representation (default: %(default)s)",
     )
     group.add_argument(
+        "--domain_loss",
+        choices=("fourier", "real"),
+        default="real",
+        help="loss computation",
+    )
+    group.add_argument(
         "--activation",
         choices=("relu", "leaky_relu"),
         default="relu",
@@ -656,7 +662,7 @@ class LitHetOnlyVAE(pl.LightningModule):
                 param.requires_grad = False
 
         if self.args.lora_structure_module:
-            self.model = apply_lora_config_to_model(self.model)
+            self.model = apply_lora_config_to_model(self.model, lora_light)
 
         if self.domain == "real":
             self.model.enc_mask = None
@@ -702,15 +708,19 @@ class LitHetOnlyVAE(pl.LightningModule):
         # Image
         y_real = self.lattice.translate_real(particles_real, tran.unsqueeze(1)).view(B, D-1, D-1)
         y_real = y_real.transpose(-1,-2)
+        y_real=y_real.contiguous()
 
-        if self.domain == "fourier":
-            y = self.lattice.translate_ft(torch.view_as_real(particles).view(B, D*D, 2), tran.unsqueeze(1)).view(B, D, D, 2)
-            # y_real = ifft2_center(torch.view_as_complex(y)).real
-        elif self.domain == "hartley":
-            y = self.lattice.translate_ht(particles.view(B, -1), tran.unsqueeze(1)).view(B, D, D)
-            # y_real = fft.iht2_center(y)
-        elif self.domain == "real":
-            y=y_real.contiguous()
+        y = self.lattice.translate_ft(torch.view_as_real(particles).view(B, D*D, 2), tran.unsqueeze(1)).view(B, D, D, 2)
+
+        if self.domain == "hartley":
+            raise 
+        # if self.domain == "fourier":
+        #     y = self.lattice.translate_ft(torch.view_as_real(particles).view(B, D*D, 2), tran.unsqueeze(1)).view(B, D, D, 2)
+        #     # y_real = ifft2_center(torch.view_as_complex(y)).real
+        # elif self.domain == "hartley":
+        #     y = self.lattice.translate_ht(particles.view(B, -1), tran.unsqueeze(1)).view(B, D, D)
+        #     # y_real = fft.iht2_center(y)
+        # elif self.domain == "real":
         
         # CTF
         if self.ctf_params is not None:
@@ -787,13 +797,16 @@ class LitHetOnlyVAE(pl.LightningModule):
             chain_index=struct["asym_id"].detach().cpu().numpy()[-1] if "asym_id" in struct else None,
             file= self.args.outdir + "/debug_%s.pdb"%str(global_it).zfill(5)
         )
-    def run_encoder(self, y, c=None):
-        if self.domain == "fourier":
-            y = (y[...,0] - y[...,1]) 
-        input_ = (y,)
+    def run_encoder(self, y, y_real, c=None):
+
         if self.domain != "real":
+            if self.domain == "fourier":
+                y = (y[...,0] - y[...,1]) 
+            input_ = (y,)
             if c is not None:
                 input_ = (x * c.sign() for x in input_)  # phase flip by the ctf
+        else:
+            input_ = (y_real,)
 
         z_mu, z_logvar = self.model.encode(*input_)
 
@@ -815,7 +828,8 @@ class LitHetOnlyVAE(pl.LightningModule):
 
         # Apply CTF
         y_recon = y_recon.view(B, -1)
-        y_recon *= c.view(B, -1)[:, mask]
+        if c is not None:
+            y_recon *= c.view(B, -1)[:, mask]
 
         # Pad mask with 0
         tmp = y_recon
@@ -853,7 +867,7 @@ class LitHetOnlyVAE(pl.LightningModule):
         y, y_real, rot, tran, c = self.prepare_batch(batch)
 
         # Encdoer
-        z_mu, z_logvar = self.run_encoder(y, c)
+        z_mu, z_logvar = self.run_encoder(y,y_real, c)
 
         # Reparametrize latent space
         z = self.model.reparameterize(z_mu, z_logvar)
@@ -869,7 +883,9 @@ class LitHetOnlyVAE(pl.LightningModule):
         loss, gen_loss, kld = self.loss_function(
             z_mu,
             z_logvar,
+            y,
             y_real,
+            y_recon,
             y_recon_real,
             mask,
             beta,
@@ -890,17 +906,17 @@ class LitHetOnlyVAE(pl.LightningModule):
         sch.step()
         
         # Logging
-        self.log("loss", loss, prog_bar=True, sync_dist=False, on_epoch=True, on_step=True)
-        self.log("kld", kld, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
+        self.log("loss", loss.item(), prog_bar=True, sync_dist=False, on_epoch=True, on_step=True)
+        self.log("kld", kld.item(), prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
         for k,v in gen_loss.items():
-            self.log(k, v, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
+            self.log(k, v.item(), prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
 
         if args.do_pose_sgd:
             rot_init, tran_init = self.posetracker.get_pose_init(batch[-1])
             pose_tran = torch.norm((tran_init-tran), dim=-1).mean()
             pose_rot = rotmat_angle_deg(rot, rot_init).mean()
-            self.log("pose_tran", pose_tran, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
-            self.log("pose_rot", pose_rot, prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
+            self.log("pose_tran", pose_tran.item(), prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
+            self.log("pose_rot", pose_rot.item(), prog_bar=False, sync_dist=False, on_epoch=True, on_step=True)
             
     # def on_after_backward(self):
     #     unused = []
@@ -916,19 +932,19 @@ class LitHetOnlyVAE(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         idx = batch[-1]
         y, y_real, rot, _, c = self.prepare_batch(batch)
-        z_mu, z_logvar = self.run_encoder(y, c)
+        z_mu, z_logvar = self.run_encoder(y,y_real, c)
 
         self.val_z_mu.append(z_mu)
         self.val_z_logvar.append(z_logvar)
         self.val_z_idx.append(idx)
 
         if dataloader_idx == 0 :
-                _,y_recon_real, _, struct = self.run_decoder(z_mu,rot, c)
-                gen_loss, total_gen_loss = self.gen_loss(y_real, y_recon_real, struct)
+                y_recon,y_recon_real, mask, struct = self.run_decoder(z_mu,rot, c)
+                gen_loss, total_gen_loss = self.gen_loss(y, y_real, y_recon, y_recon_real, mask, struct)
 
-                self.log("val_loss", total_gen_loss, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True, add_dataloader_idx=False)
+                self.log("val_loss", total_gen_loss.item(), prog_bar=False, sync_dist=True, on_epoch=True, on_step=True, add_dataloader_idx=False)
                 for k,v in gen_loss.items():
-                    self.log("val_" + k, v, prog_bar=False, sync_dist=True, on_epoch=True, on_step=True, add_dataloader_idx=False)
+                    self.log("val_" + k, v.item(), prog_bar=False, sync_dist=True, on_epoch=True, on_step=True, add_dataloader_idx=False)
 
 
 
@@ -980,9 +996,18 @@ class LitHetOnlyVAE(pl.LightningModule):
             out_weights = "{}/weights.{}.pkl".format(self.args.outdir, self.current_epoch)
             save_checkpoint(self.model, self.optimizers(), self.current_epoch, z_mu.detach().cpu().numpy(), z_logvar.detach().cpu().numpy(), out_weights, out_z)
 
-    def gen_loss(self, y, y_recon, struct):
+    def gen_loss(self, y, y_real, y_recon,y_recon_real, mask, struct):
         # Reconstruction loss
-        data_loss = torch.mean(1-get_cc(y, y_recon))
+        if args.domain_loss =="real":
+            data_loss = torch.mean(1-get_cc(y_real, y_recon_real))
+        else:
+            B = y.size(0)
+            D = y.size(-2)
+
+            y = y.view(B, D*D, 2)[:, mask]
+            y_recon = y_recon[:, mask]
+            corr = fourier_corr(torch.view_as_complex(y), y_recon)
+            data_loss = torch.mean(1 - corr)
 
         # Struct violations loss
         struct_violations = find_structural_violations(
@@ -1003,7 +1028,11 @@ class LitHetOnlyVAE(pl.LightningModule):
                 )
                 
         # Scale loss
-        scale_loss = (self.model.decoder.coef_scale ** 2).sum()
+        coef_scale = getattr(self.model.decoder, "coef_scale", None)
+        if coef_scale is not None:
+            scale_loss = (coef_scale ** 2).sum()
+        else:
+            scale_loss = torch.tensor(0.0, device=y.device)
 
         # Center Loss
         # crd = struct_to_crd(struct, ca=not self.model.decoder.all_atom)
@@ -1019,6 +1048,7 @@ class LitHetOnlyVAE(pl.LightningModule):
             # "center_loss": center_loss,
             "scale_loss": scale_loss,
             }
+
         total_gen_loss = (
             data_loss * self.args.data_loss_weight + 
             chi_loss * self.args.chi_loss_weight +
@@ -1032,14 +1062,16 @@ class LitHetOnlyVAE(pl.LightningModule):
             z_mu,
             z_logvar,
             y,
+            y_real,
             y_recon,
+            y_recon_real,
             mask,
             beta,
             struct,
         ):
 
         # total of data loss and structural contraints
-        gen_loss, total_gen_loss = self.gen_loss(y, y_recon, struct)
+        gen_loss, total_gen_loss = self.gen_loss(y, y_real, y_recon, y_recon_real, mask, struct)
 
         # latent loss
         kld = torch.mean(
@@ -1107,6 +1139,7 @@ class LitDataModule(pl.LightningDataModule):
         )
 
         indices = np.arange(self.imageDataset.N)
+        # np.random.shuffle(indices)
         first_val_ind = int(self.args.train_val_ratio * self.imageDataset.N)
         indices_train = indices[:first_val_ind]
         indices_val = indices[first_val_ind:]

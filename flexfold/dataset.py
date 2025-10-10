@@ -162,12 +162,13 @@ class ImageDataset(torch.utils.data.Dataset):
         imgs = self.src.images(index)
 
         particles_real = self._process_real(imgs)
+        particles = self._process_ft(imgs)
         if self.domain=="hartley":
-            particles = self._process(imgs)
-        elif self.domain=="fourier":
-            particles = self._process_ft(imgs)
-        else:
-            particles=None
+            raise
+        #     particles = self._process(imgs)
+        # elif self.domain=="fourier":
+        # else:
+        #     particles=None
 
         # this is why it is tricky for index to be allowed to be a list!
         if len(particles_real.shape) == 2:

@@ -747,7 +747,9 @@ class AFDecoder(torch.nn.Module):
             **self.config["structure_module"],
         )
 
-        self.coef_scale = nn.Parameter(torch.zeros(self.res_size))
+        self.refine_coefs = False
+        if self.refine_coefs:
+            self.coef_scale = nn.Parameter(torch.zeros(self.res_size))
 
     def forward(self, crd_lattice, z):
 
@@ -755,7 +757,10 @@ class AFDecoder(torch.nn.Module):
         struct = self.structure_decoder(z)
 
         # [N, 37]
-        coefs = torch.exp(self.coef_scale)[:, None] * self.atom_coefs
+        if self.refine_coefs:
+            coefs = torch.exp(self.coef_scale)[:, None] * self.atom_coefs
+        else:
+            coefs = self.atom_coefs
 
         # structure to coordinates
         crd, coefs = struct_to_crd(struct, ca=not self.all_atom, coefs=coefs)
@@ -793,7 +798,8 @@ class AFDecoder(torch.nn.Module):
             pair_update = self.decoder_(
                     z=embedding_expand["pair"],
                     latent=latent[..., None, :, :],
-                    mask=pair_mask
+                    mask=pair_mask,
+                    inplace_safe=inplace_safe
             )
         else:
             # [*, N**2, Zdim]
@@ -1637,7 +1643,6 @@ class CryoFormerStack(nn.Module):
             args=(z,),
             blocks_per_ckpt=self.blocks_per_ckpt if self.training else None,
         )
-
 
         z = self.layer_norm(z)
 

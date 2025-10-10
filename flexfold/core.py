@@ -37,7 +37,7 @@ def output_single_pdb(all_atom_positions, aatype, all_atom_mask, file, chain_ind
     with open(file, 'w') as fp:
         fp.write(outstring)
 
-def struct_to_pdb(struct, file):
+def struct_to_pdb(struct, file, return_string=False):
     aatype=struct["aatype"]
 
     atom_positions=struct["final_atom_positions"]
@@ -58,6 +58,8 @@ def struct_to_pdb(struct, file):
         parents_chain_index=None,
     )
     outstring = protein.to_pdb(pdb_elem)
+    if return_string:
+        return outstring
     with open(file, 'w') as fp:
         fp.write(outstring)
 
@@ -474,10 +476,10 @@ def vol_real(crd, grid_size = 128, sigma = 1.0, pixel_size=1.0):
     return  I.reshape(batch_dim + (grid_size, grid_size, grid_size))
 
 
-
+atomdefs={'H':(1.0,1.00794),'HO':(1.0,1.00794),'C':(6.0,12.0107),'A':(7.0,14.00674),'N':(7.0,14.00674),'O':(8.0,15.9994),'P':(15.0,30.973761),'K':(19.0,39.0983),
+    'S':(16.0,32.066),'W':(18.0,1.00794*2.0+15.9994),'AU':(79.0,196.96655) }
 def aatype_to_coefs(aatype):
-    atomdefs={'H':(1.0,1.00794),'HO':(1.0,1.00794),'C':(6.0,12.0107),'A':(7.0,14.00674),'N':(7.0,14.00674),'O':(8.0,15.9994),'P':(15.0,30.973761),'K':(19.0,39.0983),
-        'S':(16.0,32.066),'W':(18.0,1.00794*2.0+15.9994),'AU':(79.0,196.96655) }
+
 
     def atom_name_to_coef(atomlist):
         return [atomdefs[c[:1]][0] if c != "" else 0.0 for c in atomlist]

@@ -193,39 +193,99 @@ def main(args: argparse.Namespace) -> None:
 
     model, lattice = HetOnlyVAE.load(cfg, args.weights, device=device)
     model.eval()
+    with torch.no_grad():
 
-    # Multiple z
-    if args.z_start or args.zfile:
-        # Get z values
-        if args.z_start:
-            args.z_start = np.array(args.z_start)
-            args.z_end = np.array(args.z_end)
-            z = np.repeat(np.arange(args.n, dtype=np.float32), zdim).reshape(
-                (args.n, zdim)
-            )
-            z *= (args.z_end - args.z_start) / (args.n - 1)  # type: ignore
-            z += args.z_start
-        else:
-            z = np.loadtxt(args.zfile).reshape(-1, zdim)
+        # Multiple z
+        if args.z_start or args.zfile:
+            # Get z values
+            if args.z_start:
+                args.z_start = np.array(args.z_start)
+                args.z_end = np.array(args.z_end)
+                z = np.repeat(np.arange(args.n, dtype=np.float32), zdim).reshape(
+                    (args.n, zdim)
+                )
+                z *= (args.z_end - args.z_start) / (args.n - 1)  # type: ignore
+                z += args.z_start
+            else:
+                z = np.loadtxt(args.zfile).reshape(-1, zdim)
 
-        os.makedirs(args.o, exist_ok=True)
-        logger.info(f"Generating {len(z)} volumes")
-        for i, zz in enumerate(z, start=args.vol_start_index):
-            logger.info(zz)
-            if isinstance(model.decoder, AFDecoder):
-                if not args.no_volume:
-                    vol, output = model.decoder.eval_volume(
-                            lattice.coords, lattice.D, lattice.extent, norm, zz
-                    )
+            os.makedirs(args.o, exist_ok=True)
+            logger.info(f"Generating {len(z)} volumes")
+            for i, zz in enumerate(z, start=args.vol_start_index):
+                logger.info(zz)
+                if isinstance(model.decoder, AFDecoder):
+                    if not args.no_volume:
+                        vol, output = model.decoder.eval_volume(
+                                lattice.coords, lattice.D, lattice.extent, norm, zz
+                        )
+                    else:
+                        output = model.decoder.structure_decoder(
+                            torch.as_tensor(zz[None], device=lattice.coords.device, dtype=lattice.coords.dtype)
+                        )
+                    out_pdb = "{}/{}{:06d}.pdb".format(args.o, args.prefix, i)
+                    output = tensor_tree_map(lambda x: np.array(x[-1].detach().cpu()), output)
+
+                    logger.info("Writing %s ..."%out_pdb)
+
+                    crd = output["final_atom_positions"]
+                    crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
+
+                    b_factors = getattr(model.decoder,"coef_scale", None)
+                    if b_factors is not None:
+                        b_factors= b_factors[:,None].expand(-1, 37)
+                        b_factors = (b_factors**2).detach().cpu().numpy()
+                        print(b_factors)
+
+                    output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
+                    out_pdb, chain_index=output["asym_id"] if "asym_id" in output else None, residue_index=output["residue_index"],
+                    b_factors=b_factors )
+
                 else:
-                    output = model.decoder.structure_decoder(
-                        torch.as_tensor(zz[None], device=lattice.coords.device, dtype=lattice.coords.dtype)
-                    )
-                out_pdb = "{}/{}{:06d}.pdb".format(args.o, args.prefix, i)
+                    if args.downsample:
+                        raise
+                        # extent = lattice.extent * (args.downsample / (D - 1))
+                        # decoder = model.decoder
+                        # vol = decoder.eval_volume(
+                        #     lattice.get_downsample_coords(args.downsample + 1),
+                        #     args.downsample + 1,
+                        #     extent,
+                        #     norm,
+                        #     zz,
+                        # )
+                    else:
+                        vol = model.decoder.eval_volume(
+                            lattice.coords, lattice.D, lattice.extent, norm, zz
+                        )
+
+                if not args.no_volume: 
+                    out_mrc = "{}/{}{:06d}.mrc".format(args.o, args.prefix, i)
+                    if args.flip:
+                        vol = vol.flip([0])
+                    if args.invert:
+                        vol *= -1
+
+                    write_mrc(out_mrc, np.array(vol.cpu()).astype(np.float32), Apix=args.Apix)
+
+        # Single z
+        else:
+            z = np.array(args.z)
+            logger.info(z)
+            if args.downsample:
+                raise
+                # extent = lattice.extent * (args.downsample / (D - 1))
+                # vol = model.decoder.eval_volume(
+                #     lattice.get_downsample_coords(args.downsample + 1),
+                #     args.downsample + 1,
+                #     extent,
+                #     norm,
+                #     z,
+                # )
+            else:
+                vol,output = model.decoder.eval_volume(
+                    lattice.coords, lattice.D, lattice.extent, norm, z
+                )
+                out_pdb =args.o + ".pdb"
                 output = tensor_tree_map(lambda x: np.array(x[-1].detach().cpu()), output)
-
-                logger.info("Writing %s ..."%out_pdb)
-
                 crd = output["final_atom_positions"]
                 crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
 
@@ -233,77 +293,18 @@ def main(args: argparse.Namespace) -> None:
                 if b_factors is not None:
                     b_factors= b_factors[:,None].expand(-1, 37)
                     b_factors = (b_factors**2).detach().cpu().numpy()
-                    print(b_factors)
 
                 output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
-                   out_pdb, chain_index=output["asym_id"] if "asym_id" in output else None, residue_index=output["residue_index"],
-                   b_factors=b_factors )
-
-            else:
-                if args.downsample:
-                    raise
-                    # extent = lattice.extent * (args.downsample / (D - 1))
-                    # decoder = model.decoder
-                    # vol = decoder.eval_volume(
-                    #     lattice.get_downsample_coords(args.downsample + 1),
-                    #     args.downsample + 1,
-                    #     extent,
-                    #     norm,
-                    #     zz,
-                    # )
-                else:
-                    vol = model.decoder.eval_volume(
-                        lattice.coords, lattice.D, lattice.extent, norm, zz
-                    )
-
+                    out_pdb , chain_index=output["asym_id"], residue_index=output["residue_index"],
+                    b_factors=b_factors)
+                    
             if not args.no_volume: 
-                out_mrc = "{}/{}{:06d}.mrc".format(args.o, args.prefix, i)
                 if args.flip:
                     vol = vol.flip([0])
                 if args.invert:
                     vol *= -1
 
-                write_mrc(out_mrc, np.array(vol.cpu()).astype(np.float32), Apix=args.Apix)
+                write_mrc(args.o, np.array(vol.cpu()).astype(np.float32), Apix=args.Apix)
 
-    # Single z
-    else:
-        z = np.array(args.z)
-        logger.info(z)
-        if args.downsample:
-            raise
-            # extent = lattice.extent * (args.downsample / (D - 1))
-            # vol = model.decoder.eval_volume(
-            #     lattice.get_downsample_coords(args.downsample + 1),
-            #     args.downsample + 1,
-            #     extent,
-            #     norm,
-            #     z,
-            # )
-        else:
-            vol,output = model.decoder.eval_volume(
-                lattice.coords, lattice.D, lattice.extent, norm, z
-            )
-            out_pdb =args.o + ".pdb"
-            output = tensor_tree_map(lambda x: np.array(x[-1].detach().cpu()), output)
-            crd = output["final_atom_positions"]
-            crd = crd @ model.decoder.rot_init.detach().cpu().numpy() + model.decoder.trans_init[..., None, :].detach().cpu().numpy()
-
-            b_factors = getattr(model.decoder,"coef_scale", None)
-            if b_factors is not None:
-                b_factors= b_factors[:,None].expand(-1, 37)
-                b_factors = (b_factors**2).detach().cpu().numpy()
-
-            output_single_pdb(crd, output["aatype"], output["final_atom_mask"], 
-                out_pdb , chain_index=output["asym_id"], residue_index=output["residue_index"],
-                b_factors=b_factors)
-                
-        if not args.no_volume: 
-            if args.flip:
-                vol = vol.flip([0])
-            if args.invert:
-                vol *= -1
-
-            write_mrc(args.o, np.array(vol.cpu()).astype(np.float32), Apix=args.Apix)
-
-    td = dt.now() - t1
-    logger.info(f"Finished in {td}")
+        td = dt.now() - t1
+        logger.info(f"Finished in {td}")

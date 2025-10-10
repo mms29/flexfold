@@ -13,26 +13,28 @@ python scripts/run_pretrained_openfold.py  data/cryofold/jillsData/sequence/    
 
 
 
-
-
-# Preprocessing
-python ~/flexfold/scripts/rln2xmp.py particles_ctf.star particles.xmd
-xmipp_transform_filter -i particles.xmd -o particles_filtered.mrcs --save_metadata_stack particles_filtered.xmd --keep_input_columns --fourier low_pass 0.29090
-xmipp_image_resize -i particles_filtered.xmd -o particles_downsampled.mrcs --dim 128 --save_metadata_stack particles_downsampled.xmd --keep_input_columns
-python ~/flexfold/scripts/rln2xmp.py particles_downsampled.xmd particles_downsampled.star --inverse --optics_group_from particles_ctf.star --add_missing_cols_from particles_ctf.star --pixel_size 1.58 --dimension 128
-
-
-
 BASE_DIR="/home/vuillemr/flexfold/data/cryofold/jillsData/particles"
 RUN_DIR=$BASE_DIR/run
 
 
+# Preprocessing
+python ~/flexfold/scripts/rln2xmp.py particles_ctf.star particles.xmd
+xmipp_transform_window -i particles.xmd -o particles_crop.mrcs --save_metadata_stack particles_crop.xmd --keep_input_columns --crop 40 --dont_apply_geo
+python ~/flexfold/scripts/rln2xmp.py particles_crop.xmd particles_crop.star --inverse --optics_group_from particles_ctf.star --add_missing_cols_from particles_ctf.star --pixel_size 0.92 --dimension 180
+
+xmipp_transform_filter -i particles.xmd -o particles_filtered.mrcs --save_metadata_stack particles_filtered.xmd --keep_input_columns --fourier low_pass 0.29090
+xmipp_image_resize -i particles_filtered.xmd -o particles_downsampled.mrcs --dim 128 --save_metadata_stack particles_downsampled.xmd --keep_input_columns
+python ~/flexfold/scripts/rln2xmp.py particles_downsampled.xmd particles_downsampled.star --inverse --optics_group_from particles_ctf.star --add_missing_cols_from particles_ctf.star --pixel_size 1.58 --dimension 128
+
 # Convert metadata
 cryodrgn parse_ctf_star $BASE_DIR/particles_downsampled.star -o $BASE_DIR/ctf.pkl
 cryodrgn parse_pose_star $BASE_DIR/particles_downsampled.star -o $BASE_DIR/particles.pkl
-
 # Backproject for verification
 cryodrgn backproject_voxel $BASE_DIR/particles_downsampled.mrcs --poses $BASE_DIR/particles.pkl --ctf $BASE_DIR/ctf.pkl -o $BASE_DIR/backproject
+
+cryodrgn parse_ctf_star $BASE_DIR/particles_crop.star -o $BASE_DIR/ctf_crop.pkl
+cryodrgn parse_pose_star $BASE_DIR/particles_crop.star -o $BASE_DIR/particles_crop.pkl
+cryodrgn backproject_voxel $BASE_DIR/particles_crop.mrcs --poses $BASE_DIR/particles_crop.pkl --ctf $BASE_DIR/ctf_crop.pkl -o $BASE_DIR/backproject_crop
 
 # Initial pose
 python ~/flexfold/scripts/compute_initial_pose.py $BASE_DIR/initial_pose \
@@ -144,3 +146,36 @@ python -u ./scripts/train_target.py \
 
 
 BASE_DIR="/home/vuillemr/flexfold/data/cryofold/jillsData/particles"
+
+
+RUN_DIR=$BASE_DIR/run_cryodrgn
+cryodrgn train_vae $BASE_DIR/particles_crop.mrcs  \
+    --poses $BASE_DIR/particles_crop.pkl \
+    --ctf $BASE_DIR/ctf_crop.pkl \
+    -n 10 \
+    -o $RUN_DIR \
+    --batch-size 256  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 256 \
+    --enc-layers 3 \
+    --dec-dim 256 \
+    --dec-layers 3 \
+    --domain hartley 
+# Cryodrgn
+RUN_DIR=$BASE_DIR/run_cryodrgn_sgd
+cryodrgn train_vae $BASE_DIR/particles_crop.mrcs  \
+    --poses $BASE_DIR/particles_crop.pkl \
+    --ctf $BASE_DIR/ctf_crop.pkl \
+    -n 10 \
+    -o $RUN_DIR \
+    --batch-size 256  \
+    --num-workers 0 \
+    --zdim 4  \
+    --enc-dim 256 \
+    --enc-layers 3 \
+    --dec-dim 256 \
+    --dec-layers 3 \
+    --domain hartley \
+    --do-pose-sgd \
+    --pretrain 1
